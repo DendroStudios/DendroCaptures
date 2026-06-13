@@ -1,7 +1,7 @@
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
-use image::{imageops, DynamicImage, ImageOutputFormat, Rgba, RgbaImage};
+use image::{imageops, DynamicImage, ImageOutputFormat, RgbaImage};
 use keyring::Entry;
 use rand_core::OsRng;
 use screenshots::Screen;
@@ -44,12 +44,19 @@ pub struct CaptureMonitor {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CaptureLayout {
-    origin_x: i32,
-    origin_y: i32,
+pub struct AreaCaptureSession {
     width: u32,
     height: u32,
-    monitors: Vec<CaptureMonitor>,
+    scale_factor: f64,
+    origin_x: i32,
+    origin_y: i32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCaptureRecord {
+    metadata_json: String,
+    file_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,15 +89,6 @@ pub struct ActiveWindowContext {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CropRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CaptureRegionRect {
     x: i32,
     y: i32,
@@ -102,8 +100,6 @@ pub struct CaptureRegionRect {
 struct VirtualDesktopBounds {
     origin_x: i32,
     origin_y: i32,
-    width: u32,
-    height: u32,
 }
 
 fn err<E: std::fmt::Display>(error: E) -> String {
@@ -132,18 +128,22 @@ fn load_or_create_signing_key() -> Result<SigningKey, String> {
     Ok(signing_key)
 }
 
-fn encode_png(mut image: RgbaImage, quality_scale: f64) -> Result<Vec<u8>, String> {
+fn encode_png(mut image: RgbaImage, quality_scale: f64) -> Result<(Vec<u8>, u32, u32), String> {
     let scale = quality_scale.clamp(0.25, 1.0);
     if scale < 0.999 {
         let next_width = ((image.width() as f64) * scale).round().max(1.0) as u32;
         let next_height = ((image.height() as f64) * scale).round().max(1.0) as u32;
-        image = imageops::resize(&image, next_width, next_height, imageops::FilterType::Lanczos3);
+        image = imageops::resize(&image, next_width, next_height, imageops::FilterType::CatmullRom);
     }
+    let (width, height) = (image.width(), image.height());
+    // Screen captures are opaque; dropping the alpha channel makes the PNG
+    // roughly a quarter smaller and faster to encode.
+    let rgb = DynamicImage::ImageRgba8(image).into_rgb8();
     let mut out = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image)
+    DynamicImage::ImageRgb8(rgb)
         .write_to(&mut out, ImageOutputFormat::Png)
         .map_err(err)?;
-    Ok(out.into_inner())
+    Ok((out.into_inner(), width, height))
 }
 
 fn first_screen() -> Result<Screen, String> {
@@ -164,15 +164,6 @@ fn screen_for_point(x: Option<i32>, y: Option<i32>) -> Result<Screen, String> {
     }
 }
 
-fn capture_screen_for_point(
-    cursor_x: Option<i32>,
-    cursor_y: Option<i32>,
-) -> Result<(RgbaImage, Screen), String> {
-    let screen = screen_for_point(cursor_x, cursor_y)?;
-    let image = screen.capture().map_err(err)?;
-    Ok((image, screen))
-}
-
 fn virtual_desktop_bounds(screens: &[Screen]) -> Result<VirtualDesktopBounds, String> {
     let first = screens
         .first()
@@ -180,29 +171,16 @@ fn virtual_desktop_bounds(screens: &[Screen]) -> Result<VirtualDesktopBounds, St
         .display_info;
     let mut min_x = first.x;
     let mut min_y = first.y;
-    let mut max_x = first.x + first.width as i32;
-    let mut max_y = first.y + first.height as i32;
 
     for screen in screens.iter().skip(1) {
         let info = screen.display_info;
         min_x = min_x.min(info.x);
         min_y = min_y.min(info.y);
-        max_x = max_x.max(info.x + info.width as i32);
-        max_y = max_y.max(info.y + info.height as i32);
     }
-
-    let width = (max_x - min_x)
-        .try_into()
-        .map_err(|_| "The desktop capture width is invalid".to_string())?;
-    let height = (max_y - min_y)
-        .try_into()
-        .map_err(|_| "The desktop capture height is invalid".to_string())?;
 
     Ok(VirtualDesktopBounds {
         origin_x: min_x,
         origin_y: min_y,
-        width,
-        height,
     })
 }
 
@@ -229,30 +207,6 @@ fn screens_layout() -> Result<(Vec<Screen>, VirtualDesktopBounds, Vec<CaptureMon
     let bounds = virtual_desktop_bounds(&screens)?;
     let monitors = capture_monitors(&screens, bounds);
     Ok((screens, bounds, monitors))
-}
-
-fn capture_virtual_desktop() -> Result<(RgbaImage, VirtualDesktopBounds, Vec<CaptureMonitor>), String> {
-    let (screens, bounds, monitors) = screens_layout()?;
-    let mut desktop = RgbaImage::from_pixel(bounds.width, bounds.height, Rgba([0, 0, 0, 255]));
-
-    for screen in screens {
-        let info = screen.display_info;
-        let mut image = screen.capture().map_err(err)?;
-        if image.width() != info.width || image.height() != info.height {
-            image = imageops::resize(
-                &image,
-                info.width.max(1),
-                info.height.max(1),
-                imageops::FilterType::Lanczos3,
-            );
-        }
-
-        let x = i64::from(info.x - bounds.origin_x);
-        let y = i64::from(info.y - bounds.origin_y);
-        imageops::overlay(&mut desktop, &image, x, y);
-    }
-
-    Ok((desktop, bounds, monitors))
 }
 
 fn empty_capture_monitors() -> Vec<CaptureMonitor> {
@@ -322,17 +276,45 @@ fn local_capture_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String
     Ok(dir.join(safe_filename))
 }
 
+fn local_captures_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("local-captures");
+    fs::create_dir_all(&dir).map_err(err)?;
+    Ok(dir)
+}
+
+fn validated_local_capture_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let root = local_captures_root(app)?.canonicalize().map_err(err)?;
+    let candidate = PathBuf::from(path);
+    let candidate = candidate.canonicalize().map_err(err)?;
+    if !candidate.starts_with(&root) {
+        return Err("Capture file is outside the DendroCapture local history".to_string());
+    }
+    Ok(candidate)
+}
+
 #[tauri::command]
-fn save_pending_capture(app: AppHandle, id: String, png_base64: String) -> Result<(), String> {
+async fn save_pending_capture(app: AppHandle, id: String, png_base64: String) -> Result<(), String> {
     let bytes = BASE64.decode(png_base64).map_err(err)?;
     let path = pending_capture_path(&app, &id)?;
     fs::write(path, bytes).map_err(err)
 }
 
 #[tauri::command]
-fn read_pending_capture(app: AppHandle, id: String) -> Result<String, String> {
+async fn read_pending_capture(app: AppHandle, id: String) -> Result<String, String> {
     let path = pending_capture_path(&app, &id)?;
     let bytes = fs::read(path).map_err(err)?;
+    Ok(BASE64.encode(bytes))
+}
+
+#[tauri::command]
+async fn read_local_capture(app: AppHandle, path: String) -> Result<String, String> {
+    let path = validated_local_capture_path(&app, &path)?;
+    let bytes = fs::read(path).map_err(err)?;
+    image::load_from_memory(&bytes).map_err(err)?;
     Ok(BASE64.encode(bytes))
 }
 
@@ -347,7 +329,7 @@ fn delete_pending_capture(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn save_local_capture(
+async fn save_local_capture(
     app: AppHandle,
     filename: String,
     png_base64: String,
@@ -367,7 +349,56 @@ fn save_local_capture(
 }
 
 #[tauri::command]
-fn ensure_device_keypair() -> Result<DevicePublicKey, String> {
+async fn overwrite_local_capture(
+    app: AppHandle,
+    path: String,
+    png_base64: String,
+    metadata_json: String,
+) -> Result<LocalCaptureSave, String> {
+    let path = validated_local_capture_path(&app, &path)?;
+    let bytes = BASE64.decode(png_base64).map_err(err)?;
+    image::load_from_memory(&bytes).map_err(err)?;
+    fs::write(&path, bytes).map_err(err)?;
+    if !metadata_json.trim().is_empty() {
+        let metadata_path = path.with_extension("json");
+        fs::write(metadata_path, metadata_json).map_err(err)?;
+    }
+    Ok(LocalCaptureSave {
+        file_path: path.to_string_lossy().to_string(),
+    })
+}
+
+fn launched_hidden_flag() -> bool {
+    std::env::args().any(|arg| arg == "--hidden")
+}
+
+#[tauri::command]
+fn launched_hidden() -> bool {
+    launched_hidden_flag()
+}
+
+#[tauri::command]
+async fn reveal_in_folder(path: String) -> Result<(), String> {
+    if !Path::new(&path).exists() {
+        return Err("File no longer exists".to_string());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
+}
+
+#[tauri::command]
+async fn reveal_pending_capture(app: AppHandle, id: String) -> Result<(), String> {
+    let path = pending_capture_path(&app, &id)?;
+    if !path.exists() {
+        return Err("Capture file no longer exists".to_string());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
+}
+
+// Async: keyring access talks to the OS credential store and must never be
+// able to stall the main thread (a blocked main thread makes the tray and
+// window controls unresponsive - the app looks alive but nothing reacts).
+#[tauri::command]
+async fn ensure_device_keypair() -> Result<DevicePublicKey, String> {
     let signing_key = load_or_create_signing_key()?;
     Ok(DevicePublicKey {
         public_key: BASE64.encode(signing_key.verifying_key().to_bytes()),
@@ -375,59 +406,14 @@ fn ensure_device_keypair() -> Result<DevicePublicKey, String> {
 }
 
 #[tauri::command]
-fn sign_challenge(challenge_id: String, challenge: String) -> Result<String, String> {
+async fn sign_challenge(challenge_id: String, challenge: String) -> Result<String, String> {
     let signing_key = load_or_create_signing_key()?;
     let message = format!("dendro-capture:{challenge_id}:{challenge}");
     Ok(BASE64.encode(signing_key.sign(message.as_bytes()).to_bytes()))
 }
 
 #[tauri::command]
-fn capture_fullscreen(
-    quality_scale: f64,
-    cursor_x: Option<i32>,
-    cursor_y: Option<i32>,
-) -> Result<CaptureResult, String> {
-    let (image, screen) = capture_screen_for_point(cursor_x, cursor_y)?;
-    let info = screen.display_info;
-    let display_width = image.width();
-    let display_height = image.height();
-    let png = encode_png(image, quality_scale)?;
-    let decoded = image::load_from_memory(&png).map_err(err)?.to_rgba8();
-    Ok(CaptureResult {
-        png_base64: BASE64.encode(png),
-        width: decoded.width(),
-        height: decoded.height(),
-        display_width,
-        display_height,
-        scale_factor: 1.0,
-        origin_x: info.x,
-        origin_y: info.y,
-        monitors: vec![CaptureMonitor {
-            id: info.id,
-            x: 0,
-            y: 0,
-            width: display_width,
-            height: display_height,
-            scale_factor: f64::from(info.scale_factor),
-            is_primary: info.is_primary,
-        }],
-    })
-}
-
-#[tauri::command]
-fn capture_layout() -> Result<CaptureLayout, String> {
-    let (_, bounds, monitors) = screens_layout()?;
-    Ok(CaptureLayout {
-        origin_x: bounds.origin_x,
-        origin_y: bounds.origin_y,
-        width: bounds.width,
-        height: bounds.height,
-        monitors,
-    })
-}
-
-#[tauri::command]
-fn capture_monitor_previews(max_width: u32) -> Result<Vec<MonitorPreview>, String> {
+async fn capture_monitor_previews(max_width: u32) -> Result<Vec<MonitorPreview>, String> {
     let (screens, bounds, _) = screens_layout()?;
     let max_width = max_width.clamp(80, 420);
     let mut previews = Vec::with_capacity(screens.len());
@@ -439,7 +425,7 @@ fn capture_monitor_previews(max_width: u32) -> Result<Vec<MonitorPreview>, Strin
         let width = max_width;
         let height = ((image.height() as f64) * scale).round().max(1.0) as u32;
         let thumb = imageops::resize(&image, width, height, imageops::FilterType::Triangle);
-        let png = encode_png(thumb, 1.0)?;
+        let (png, _, _) = encode_png(thumb, 1.0)?;
         previews.push(MonitorPreview {
             monitor: CaptureMonitor {
                 id: info.id,
@@ -460,7 +446,7 @@ fn capture_monitor_previews(max_width: u32) -> Result<Vec<MonitorPreview>, Strin
 }
 
 #[tauri::command]
-fn capture_display(monitor_id: u32, quality_scale: f64) -> Result<CaptureResult, String> {
+async fn capture_display(monitor_id: u32, quality_scale: f64) -> Result<CaptureResult, String> {
     let screen = Screen::all()
         .map_err(err)?
         .into_iter()
@@ -470,12 +456,11 @@ fn capture_display(monitor_id: u32, quality_scale: f64) -> Result<CaptureResult,
     let image = screen.capture().map_err(err)?;
     let display_width = image.width();
     let display_height = image.height();
-    let png = encode_png(image, quality_scale)?;
-    let decoded = image::load_from_memory(&png).map_err(err)?.to_rgba8();
+    let (png, width, height) = encode_png(image, quality_scale)?;
     Ok(CaptureResult {
         png_base64: BASE64.encode(png),
-        width: decoded.width(),
-        height: decoded.height(),
+        width,
+        height,
         display_width,
         display_height,
         scale_factor: f64::from(info.scale_factor),
@@ -486,213 +471,186 @@ fn capture_display(monitor_id: u32, quality_scale: f64) -> Result<CaptureResult,
 }
 
 #[tauri::command]
-fn capture_region(rect: CaptureRegionRect, quality_scale: f64) -> Result<CaptureResult, String> {
-    let screens = Screen::all().map_err(err)?;
-    let width = rect.width.max(1);
-    let height = rect.height.max(1);
-    let rx1 = rect.x;
-    let ry1 = rect.y;
-    let rx2 = rect.x + width as i32;
-    let ry2 = rect.y + height as i32;
-    struct RegionPiece {
-        image: RgbaImage,
-        ix1: i32,
-        iy1: i32,
-        ix2: i32,
-        iy2: i32,
-    }
+async fn begin_area_capture(
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
+) -> Result<AreaCaptureSession, String> {
+    let screen = screen_for_point(cursor_x, cursor_y)?;
+    let info = screen.display_info;
+    Ok(AreaCaptureSession {
+        width: info.width,
+        height: info.height,
+        scale_factor: f64::from(info.scale_factor),
+        origin_x: info.x,
+        origin_y: info.y,
+    })
+}
 
-    let mut pieces: Vec<RegionPiece> = Vec::new();
-    let mut output_scale_x = 1.0_f64;
-    let mut output_scale_y = 1.0_f64;
-
-    for screen in screens {
-        let info = screen.display_info;
-        let sx1 = info.x;
-        let sy1 = info.y;
-        let sx2 = info.x + info.width as i32;
-        let sy2 = info.y + info.height as i32;
-        let ix1 = rx1.max(sx1);
-        let iy1 = ry1.max(sy1);
-        let ix2 = rx2.min(sx2);
-        let iy2 = ry2.min(sy2);
-        if ix1 >= ix2 || iy1 >= iy2 {
-            continue;
-        }
-
-        let image = screen.capture().map_err(err)?;
-        let scale_x = image.width() as f64 / f64::from(info.width.max(1));
-        let scale_y = image.height() as f64 / f64::from(info.height.max(1));
-        output_scale_x = output_scale_x.max(scale_x);
-        output_scale_y = output_scale_y.max(scale_y);
-
-        let src_x = (((ix1 - info.x) as f64) * scale_x)
-            .round()
-            .clamp(0.0, image.width().saturating_sub(1) as f64) as u32;
-        let src_y = (((iy1 - info.y) as f64) * scale_y)
-            .round()
-            .clamp(0.0, image.height().saturating_sub(1) as f64) as u32;
-        let src_w = (((ix2 - ix1) as f64) * scale_x)
-            .round()
-            .max(1.0) as u32;
-        let src_h = (((iy2 - iy1) as f64) * scale_y)
-            .round()
-            .max(1.0) as u32;
-        let src_w = src_w.min(image.width().saturating_sub(src_x)).max(1);
-        let src_h = src_h.min(image.height().saturating_sub(src_y)).max(1);
-        let piece = imageops::crop_imm(&image, src_x, src_y, src_w, src_h).to_image();
-
-        pieces.push(RegionPiece {
-            image: piece,
-            ix1,
-            iy1,
-            ix2,
-            iy2,
-        });
-    }
-
-    if pieces.is_empty() {
-        return Err("Selected region is outside the available displays".to_string());
-    }
-
-    let out_width = ((width as f64) * output_scale_x).round().max(1.0) as u32;
-    let out_height = ((height as f64) * output_scale_y).round().max(1.0) as u32;
-    let mut out = RgbaImage::from_pixel(out_width, out_height, Rgba([0, 0, 0, 0]));
-
-    for mut piece in pieces {
-        let dst_x = (((piece.ix1 - rx1) as f64) * output_scale_x).round().max(0.0) as i64;
-        let dst_y = (((piece.iy1 - ry1) as f64) * output_scale_y).round().max(0.0) as i64;
-        let dst_w = (((piece.ix2 - piece.ix1) as f64) * output_scale_x)
-            .round()
-            .max(1.0) as u32;
-        let dst_h = (((piece.iy2 - piece.iy1) as f64) * output_scale_y)
-            .round()
-            .max(1.0) as u32;
-
-        if piece.image.width() != dst_w || piece.image.height() != dst_h {
-            piece.image = imageops::resize(&piece.image, dst_w, dst_h, imageops::FilterType::Lanczos3);
-        }
-
-        imageops::overlay(&mut out, &piece.image, dst_x, dst_y);
-    }
-
-    let png = encode_png(out, quality_scale)?;
-    let decoded = image::load_from_memory(&png).map_err(err)?.to_rgba8();
+#[tauri::command]
+async fn finish_area_capture(rect: CaptureRegionRect, quality_scale: f64) -> Result<CaptureResult, String> {
+    let screen = screen_for_point(Some(rect.x), Some(rect.y))?;
+    let info = screen.display_info;
+    let image = screen.capture().map_err(err)?;
+    let scale_x = image.width() as f64 / f64::from(info.width.max(1));
+    let scale_y = image.height() as f64 / f64::from(info.height.max(1));
+    let x = (((rect.x - info.x) as f64) * scale_x)
+        .round()
+        .clamp(0.0, image.width().saturating_sub(1) as f64) as u32;
+    let y = (((rect.y - info.y) as f64) * scale_y)
+        .round()
+        .clamp(0.0, image.height().saturating_sub(1) as f64) as u32;
+    let width = ((f64::from(rect.width.max(1)) * scale_x).round().max(1.0) as u32)
+        .min(image.width() - x)
+        .max(1);
+    let height = ((f64::from(rect.height.max(1)) * scale_y).round().max(1.0) as u32)
+        .min(image.height() - y)
+        .max(1);
+    let display_width = width;
+    let display_height = height;
+    let cropped = imageops::crop_imm(&image, x, y, width, height).to_image();
+    let (png, out_width, out_height) = encode_png(cropped, quality_scale)?;
     Ok(CaptureResult {
         png_base64: BASE64.encode(png),
-        width: decoded.width(),
-        height: decoded.height(),
-        display_width: out_width,
-        display_height: out_height,
-        scale_factor: (output_scale_x + output_scale_y) / 2.0,
+        width: out_width,
+        height: out_height,
+        display_width,
+        display_height,
+        scale_factor: f64::from(info.scale_factor),
         origin_x: rect.x,
         origin_y: rect.y,
         monitors: empty_capture_monitors(),
     })
 }
 
+/// Makes the capture overlay non-occluding for Chromium-based apps so a
+/// browser underneath keeps rendering video instead of freezing as "hidden".
+/// Chromium's native window occlusion tracker skips a window when it is a
+/// layered window with alpha below 255 OR when it has a complex (non
+/// rectangular) window region; both are applied here because either can be
+/// reset by the windowing stack. Visually the overlay stays indistinguishable
+/// from opaque: alpha is 254/255 and the region only drops one corner pixel.
 #[tauri::command]
-fn prepare_area_capture() -> Result<CaptureResult, String> {
-    let (image, bounds, monitors) = capture_virtual_desktop()?;
-    let png = encode_png(image, 1.0)?;
-    Ok(CaptureResult {
-        png_base64: BASE64.encode(png),
-        width: bounds.width,
-        height: bounds.height,
-        display_width: bounds.width,
-        display_height: bounds.height,
-        scale_factor: 1.0,
-        origin_x: bounds.origin_x,
-        origin_y: bounds.origin_y,
-        monitors,
-    })
+fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("capture-overlay")
+        .ok_or_else(|| "Capture overlay window was not found".to_string())?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Graphics::Gdi::{
+            CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_OR,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+            GWL_EXSTYLE, GWL_STYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED,
+            WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+        };
+
+        let hwnd = window.hwnd().map_err(err)?.0 as windows_sys::Win32::Foundation::HWND;
+        let size = window.outer_size().map_err(err)?;
+        let width = size.width.max(2) as i32;
+        let height = size.height.max(2) as i32;
+
+        unsafe {
+            // Tauri asks for a borderless overlay, but Windows can briefly
+            // surface native chrome while a no-activate overlay is dragged.
+            // Clear it explicitly before every capture session.
+            let chrome_bits = (WS_CAPTION
+                | WS_THICKFRAME
+                | WS_SYSMENU
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX) as isize;
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !chrome_bits);
+
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                (ex_style | WS_EX_LAYERED as isize | WS_EX_TOOLWINDOW as isize)
+                    & !(WS_EX_APPWINDOW as isize),
+            );
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            // Best effort: the window region below is the reliable exclusion.
+            SetLayeredWindowAttributes(hwnd, 0, 254, LWA_ALPHA);
+
+            // Full window minus a 1x1 notch at the bottom-right corner; two
+            // rectangles make GetWindowRgn report COMPLEXREGION.
+            let main_region = CreateRectRgn(0, 0, width, height - 1);
+            let bottom_region = CreateRectRgn(0, height - 1, width - 1, height);
+            let combined = CreateRectRgn(0, 0, 0, 0);
+            CombineRgn(combined, main_region, bottom_region, RGN_OR);
+            DeleteObject(main_region as _);
+            DeleteObject(bottom_region as _);
+            // On success the system owns the region handle.
+            if SetWindowRgn(hwnd, combined, 1) == 0 {
+                DeleteObject(combined as _);
+                return Err("Could not configure the capture overlay window".to_string());
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
-fn prepare_area_capture_for_point(
-    cursor_x: Option<i32>,
-    cursor_y: Option<i32>,
-) -> Result<CaptureResult, String> {
-    let (image, screen) = capture_screen_for_point(cursor_x, cursor_y)?;
-    let info = screen.display_info;
-    let display_width = image.width();
-    let display_height = image.height();
-    let png = encode_png(image, 1.0)?;
-    Ok(CaptureResult {
-        png_base64: BASE64.encode(png),
-        width: display_width,
-        height: display_height,
-        display_width,
-        display_height,
-        scale_factor: f64::from(info.scale_factor),
-        origin_x: info.x,
-        origin_y: info.y,
-        monitors: vec![CaptureMonitor {
-            id: info.id,
-            x: 0,
-            y: 0,
-            width: display_width,
-            height: display_height,
-            scale_factor: f64::from(info.scale_factor),
-            is_primary: info.is_primary,
-        }],
-    })
+async fn list_local_captures(app: AppHandle, limit: usize) -> Result<Vec<LocalCaptureRecord>, String> {
+    let root = local_captures_root(&app)?;
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+
+    for month in fs::read_dir(&root).map_err(err)? {
+        let month = month.map_err(err)?.path();
+        if !month.is_dir() {
+            continue;
+        }
+        for file in fs::read_dir(&month).map_err(err)? {
+            let file = file.map_err(err)?;
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let modified = file
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((modified, path));
+        }
+    }
+
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut records = Vec::new();
+    for (_, json_path) in entries.into_iter().take(limit.clamp(1, 200)) {
+        let png_path = json_path.with_extension("png");
+        if !png_path.exists() {
+            continue;
+        }
+        let Ok(metadata_json) = fs::read_to_string(&json_path) else {
+            continue;
+        };
+        records.push(LocalCaptureRecord {
+            metadata_json,
+            file_path: png_path.to_string_lossy().to_string(),
+        });
+    }
+    Ok(records)
 }
 
 #[tauri::command]
-fn prepare_area_overlay_for_point(
-    cursor_x: Option<i32>,
-    cursor_y: Option<i32>,
-) -> Result<CaptureResult, String> {
-    let screen = screen_for_point(cursor_x, cursor_y)?;
-    let info = screen.display_info;
-    Ok(CaptureResult {
-        png_base64: String::new(),
-        width: info.width,
-        height: info.height,
-        display_width: info.width,
-        display_height: info.height,
-        scale_factor: f64::from(info.scale_factor),
-        origin_x: info.x,
-        origin_y: info.y,
-        monitors: vec![CaptureMonitor {
-            id: info.id,
-            x: 0,
-            y: 0,
-            width: info.width,
-            height: info.height,
-            scale_factor: f64::from(info.scale_factor),
-            is_primary: info.is_primary,
-        }],
-    })
-}
-
-#[tauri::command]
-fn crop_capture(png_base64: String, rect: CropRect, quality_scale: f64) -> Result<CaptureResult, String> {
-    let bytes = BASE64.decode(png_base64).map_err(err)?;
-    let image = image::load_from_memory(&bytes).map_err(err)?.to_rgba8();
-    let x = rect.x.min(image.width().saturating_sub(1));
-    let y = rect.y.min(image.height().saturating_sub(1));
-    let width = rect.width.min(image.width().saturating_sub(x)).max(1);
-    let height = rect.height.min(image.height().saturating_sub(y)).max(1);
-    let cropped = imageops::crop_imm(&image, x, y, width, height).to_image();
-    let png = encode_png(cropped, quality_scale)?;
-    let decoded = image::load_from_memory(&png).map_err(err)?.to_rgba8();
-    Ok(CaptureResult {
-        png_base64: BASE64.encode(png),
-        width: decoded.width(),
-        height: decoded.height(),
-        display_width: image.width(),
-        display_height: image.height(),
-        scale_factor: 1.0,
-        origin_x: 0,
-        origin_y: 0,
-        monitors: empty_capture_monitors(),
-    })
-}
-
-#[tauri::command]
-fn copy_png_to_clipboard(png_base64: String) -> Result<(), String> {
+async fn copy_png_to_clipboard(png_base64: String) -> Result<(), String> {
     let bytes = BASE64.decode(png_base64).map_err(err)?;
     let image = image::load_from_memory(&bytes).map_err(err)?.to_rgba8();
     let width = image.width() as usize;
@@ -802,18 +760,44 @@ fn active_window_context() -> ActiveWindowContext {
     platform_active_window_context()
 }
 
-fn protect_main_window<R: Runtime>(app: &AppHandle<R>) {
+fn hide_main_window_for_tray<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_content_protected(false);
+        let _ = window.set_skip_taskbar(true);
+        let _ = window.hide();
     }
+}
+
+fn window_is_on_a_monitor<R: Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
+    let (Ok(position), Ok(size), Ok(monitors)) = (
+        window.outer_position(),
+        window.outer_size(),
+        window.available_monitors(),
+    ) else {
+        return true;
+    };
+    monitors.iter().any(|monitor| {
+        let origin = monitor.position();
+        let bounds = monitor.size();
+        position.x < origin.x + bounds.width as i32
+            && position.x + size.width as i32 > origin.x
+            && position.y < origin.y + bounds.height as i32
+            && position.y + size.height as i32 > origin.y
+    })
 }
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_content_protected(false);
         let _ = window.set_skip_taskbar(false);
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        // A monitor change can leave the window stranded outside every
+        // display: it "opens" but nothing appears on screen.
+        if !window_is_on_a_monitor(&window) {
+            let _ = window.center();
+        }
     }
 }
 
@@ -856,29 +840,42 @@ fn create_tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|arg| arg == "--hidden") {
+                hide_main_window_for_tray(app);
+            } else {
+                show_main_window(app);
+            }
+        }))
         .setup(|app| {
+            hide_main_window_for_tray(app.handle());
             create_tray(app)?;
-            protect_main_window(app.handle());
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             save_pending_capture,
             read_pending_capture,
+            read_local_capture,
             delete_pending_capture,
             save_local_capture,
+            overwrite_local_capture,
+            list_local_captures,
+            launched_hidden,
+            reveal_in_folder,
+            reveal_pending_capture,
             ensure_device_keypair,
             sign_challenge,
-            capture_fullscreen,
-            capture_layout,
             capture_monitor_previews,
             capture_display,
-            capture_region,
-            prepare_area_capture,
-            prepare_area_capture_for_point,
-            prepare_area_overlay_for_point,
-            crop_capture,
+            begin_area_capture,
+            finish_area_capture,
+            prepare_overlay_window,
             copy_png_to_clipboard,
             platform_label,
             active_window_context,

@@ -7,6 +7,10 @@ export default defineConfig({
   server: {
     strictPort: true,
     port: 1420,
+    watch: {
+      // Rust build artifacts must not trigger frontend reloads.
+      ignored: ['**/src-tauri/**'],
+    },
   },
   envPrefix: ['VITE_', 'TAURI_'],
 });

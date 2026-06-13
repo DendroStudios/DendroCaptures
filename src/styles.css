@@ -57,7 +57,7 @@
 body {
   margin: 0;
   min-width: 740px;
-  min-height: 500px;
+  min-height: 440px;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -69,7 +69,7 @@ body.dc-capture-overlay-body {
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: transparent;
+  background: transparent !important;
 }
 
 button,
@@ -263,12 +263,59 @@ button[disabled],
   flex-direction: column;
   gap: 10px;
   padding: 12px 14px 14px;
-  overflow: hidden;
+  overflow: hidden auto;
   border-right: 1px solid rgba(151, 184, 224, 0.10);
 }
 
+/* Collapsed sidebar: icon-only rail so the preview gets the space. */
+.dc-layout.collapsed {
+  grid-template-columns: 64px minmax(0, 1fr);
+}
+
+.dc-layout.collapsed .dc-sidebar {
+  padding: 10px 8px 12px;
+}
+
+.dc-layout.collapsed .dc-profile-card {
+  min-height: 0;
+  justify-content: center;
+  padding: 7px;
+}
+
+.dc-layout.collapsed .dc-profile-card img {
+  width: 34px;
+  height: 34px;
+}
+
+.dc-layout.collapsed .dc-profile-card span {
+  display: none;
+}
+
+.dc-layout.collapsed .dc-nav button {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 0;
+}
+
+.dc-layout.collapsed .dc-nav button span,
+.dc-layout.collapsed .dc-nav button kbd {
+  display: none;
+}
+
+.dc-layout.collapsed .dc-connection-card {
+  min-height: 0;
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding: 12px 6px;
+}
+
+.dc-layout.collapsed .dc-connection-card > span:not(.dc-connection-dot),
+.dc-layout.collapsed .dc-connection-card > svg {
+  display: none;
+}
+
 .dc-profile-card {
-  min-height: 104px;
+  min-height: clamp(78px, 14vh, 104px);
   display: flex;
   align-items: center;
   gap: 14px;
@@ -313,9 +360,14 @@ button[disabled],
 
 .dc-profile-card small,
 .dc-connection-card small {
-  margin-top: 5px;
+  margin-top: 4px;
   color: var(--muted);
-  line-height: 1.45;
+  line-height: 1.35;
+  font-size: clamp(11px, 1.8vh, 13px);
+}
+
+.dc-connection-card strong {
+  font-size: clamp(13px, 2.2vh, 16px);
 }
 
 .dc-profile-card small {
@@ -334,7 +386,7 @@ button[disabled],
 }
 
 .dc-nav button {
-  height: 47px;
+  height: clamp(40px, 7vh, 47px);
   display: grid;
   grid-template-columns: 30px 1fr auto;
   align-items: center;
@@ -362,7 +414,7 @@ button[disabled],
 
 .dc-nav button span {
   font-family: var(--font-condensed);
-  font-size: 18px;
+  font-size: clamp(15px, 2.8vh, 18px);
   font-weight: 900;
 }
 
@@ -383,7 +435,7 @@ kbd {
 
 .dc-connection-card {
   margin-top: auto;
-  min-height: 72px;
+  min-height: 0;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
@@ -417,7 +469,8 @@ kbd {
 }
 
 .dc-main {
-  overflow: hidden;
+  /* Scroll as a last resort instead of letting panels paint over each other. */
+  overflow: hidden auto;
   padding: 18px;
   display: flex;
   flex-direction: column;
@@ -435,7 +488,7 @@ kbd {
 .dc-header h1 {
   margin: 0;
   font-family: var(--font-condensed);
-  font-size: 31px;
+  font-size: clamp(23px, 4.6vh, 31px);
   line-height: 1;
   font-weight: 900;
 }
@@ -443,7 +496,7 @@ kbd {
 .dc-header p {
   margin: 7px 0 0;
   color: var(--muted);
-  font-size: 15px;
+  font-size: clamp(12px, 2.2vh, 15px);
 }
 
 .dc-status-pill {
@@ -475,7 +528,9 @@ kbd {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(228px, 0.58fr) minmax(0, 1.42fr);
-  grid-template-rows: minmax(0, 1fr) minmax(148px, auto);
+  /* min-content keeps the action buttons from overflowing onto the queue row;
+     the preview panel opts out via min-height: 0 so images can't blow up the track. */
+  grid-template-rows: minmax(min-content, 1fr) minmax(148px, auto);
   gap: 12px;
 }
 
@@ -484,7 +539,6 @@ kbd {
   grid-template-rows: auto auto;
   align-content: start;
   gap: 10px;
-  min-height: 0;
 }
 
 .dc-action-slot {
@@ -651,11 +705,11 @@ kbd {
 }
 
 .dc-preview-panel img {
-  max-width: 100%;
-  max-height: calc(100% - 58px);
+  width: 100%;
+  height: 100%;
   display: block;
+  object-fit: contain;
   border-radius: 7px;
-  box-shadow: 0 26px 84px rgba(0, 0, 0, 0.58);
 }
 
 .dc-preview-meta {
@@ -710,6 +764,10 @@ kbd {
 
 .dc-queue-card {
   min-height: 148px;
+}
+
+.dc-main > .dc-history-panel {
+  flex: 1 1 auto;
 }
 
 .dc-panel-head {
@@ -810,6 +868,16 @@ kbd {
   color: var(--muted);
 }
 
+.dc-clickable {
+  cursor: pointer;
+}
+
+.dc-queue-row img.dc-clickable:hover,
+.dc-queue-placeholder.dc-clickable:hover {
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 3px rgba(91, 156, 255, 0.08);
+}
+
 .dc-queue-row strong,
 .dc-queue-row small {
   display: block;
@@ -887,13 +955,30 @@ kbd {
   font-family: var(--font-ui);
 }
 
+.dc-card-action {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(91, 156, 255, 0.10);
+}
+
+.dc-card-action:hover {
+  border-color: var(--line-strong);
+  background: rgba(91, 156, 255, 0.18);
+}
+
 .dc-settings {
   flex: 1;
   min-height: 0;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
-  overflow: hidden;
+  overflow: hidden auto;
 }
 
 .dc-settings .dc-panel {
@@ -1048,14 +1133,235 @@ kbd {
   line-height: 1.5;
 }
 
+.dc-annotation-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: stretch;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.dc-annotation-editor {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #10151c;
+}
+
+.dc-annotation-toolbar {
+  flex: 0 0 auto;
+  min-height: 66px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.12);
+  background: rgba(255, 255, 255, 0.96);
+  color: #1e293b;
+}
+
+/* Controls must never be crushed or clipped; the toolbar wraps onto extra
+   rows instead when the window is narrow. */
+.dc-annotation-toolbar > * {
+  flex: 0 0 auto;
+}
+
+.dc-annotation-title {
+  flex: 0 1 auto;
+  min-width: 56px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #334155;
+  font-weight: 900;
+}
+
+.dc-annotation-tool-group {
+  display: inline-flex;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.dc-annotation-tool-group button {
+  flex: 0 0 auto;
+}
+
+.dc-annotation-tool-group button,
+.dc-annotation-toolbar > button,
+.dc-annotation-icon {
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 0;
+  border-right: 1px solid rgba(15, 23, 42, 0.12);
+  background: #fff;
+  color: #334155;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.dc-annotation-tool-group button:last-child {
+  border-right: 0;
+}
+
+.dc-annotation-tool-group button.active {
+  background: #e8f1ff;
+  color: #1e64b7;
+}
+
+.dc-annotation-toolbar > button,
+.dc-annotation-icon {
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 8px;
+}
+
+.dc-annotation-toolbar button:disabled {
+  opacity: 0.46;
+  cursor: not-allowed;
+}
+
+.dc-annotation-color,
+.dc-annotation-range,
+.dc-annotation-replace {
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.dc-annotation-color input {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.dc-annotation-range input {
+  width: 112px;
+}
+
+.dc-annotation-range.disabled {
+  opacity: 0.5;
+}
+
+.dc-annotation-range input:disabled {
+  cursor: not-allowed;
+}
+
+.dc-annotation-spacer {
+  flex: 1 1 0;
+}
+
+.dc-annotation-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 20px;
+  background:
+    linear-gradient(45deg, #242831 25%, transparent 25%),
+    linear-gradient(-45deg, #242831 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #242831 75%),
+    linear-gradient(-45deg, transparent 75%, #242831 75%);
+  background-color: #1b1f27;
+  background-size: 24px 24px;
+  background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+}
+
+.dc-annotation-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  border-radius: 5px;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.42);
+  cursor: crosshair;
+}
+
+.dc-annotation-canvas.is-selecting {
+  cursor: grab;
+}
+
+.dc-annotation-canvas.is-selecting:active {
+  cursor: grabbing;
+}
+
+.dc-annotation-text {
+  position: absolute;
+  z-index: 3;
+  min-width: 160px;
+  min-height: 1.7em;
+  padding: 4px 6px;
+  border: 2px solid rgba(80, 164, 255, 0.95);
+  border-radius: 5px;
+  outline: 0;
+  background: rgba(0, 0, 0, 0.18);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5), 0 8px 24px rgba(0, 0, 0, 0.34);
+  color: #ff2c22;
+  font-family: Arial, Helvetica, sans-serif;
+  font-weight: 700;
+  line-height: 1.12;
+  overflow: hidden;
+  resize: none;
+  text-shadow:
+    0 2px 2px rgba(0, 0, 0, 0.85),
+    1px 0 1px rgba(0, 0, 0, 0.85),
+    -1px 0 1px rgba(0, 0, 0, 0.85);
+}
+
+.dc-annotation-text::placeholder {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.dc-annotation-message,
+.dc-annotation-error {
+  position: absolute;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.dc-annotation-message {
+  border: 1px solid rgba(151, 184, 224, 0.24);
+  background: rgba(5, 8, 13, 0.82);
+  color: var(--muted);
+}
+
+.dc-annotation-error {
+  border: 1px solid rgba(255, 80, 80, 0.38);
+  background: rgba(40, 5, 8, 0.88);
+  color: var(--danger);
+}
+
 .dc-fullscreen-picker {
   position: absolute;
   left: 14px;
   top: 72px;
   bottom: 14px;
   z-index: 7;
-  width: min(330px, calc(100% - 176px));
-  min-width: 238px;
+  width: min(330px, calc(100% - 28px));
+  min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1185,21 +1491,14 @@ kbd {
   cursor: wait;
 }
 
-.dc-overlay-soft-dim {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.24);
-  pointer-events: none;
-}
-
 .dc-selection {
   position: fixed;
+  z-index: 2;
   border: 1px solid #84bdff;
-  background: rgba(91, 156, 255, 0.07);
+  background: transparent;
   box-shadow:
-    0 0 0 9999px rgba(0, 0, 0, 0.48),
     0 0 0 1px rgba(255, 255, 255, 0.22),
-    0 12px 34px rgba(0, 0, 0, 0.28);
+    0 0 12px rgba(91, 156, 255, 0.38);
   pointer-events: none;
 }
 
@@ -1245,33 +1544,9 @@ kbd {
   white-space: nowrap;
 }
 
-.dc-overlay-hud {
-  position: fixed;
-  left: 18px;
-  top: 18px;
-  display: grid;
-  gap: 2px;
-  padding: 10px 12px;
-  border: 1px solid rgba(132, 189, 255, 0.28);
-  border-radius: 8px;
-  color: #fff;
-  background: rgba(5, 8, 13, 0.72);
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
-}
-
-.dc-overlay-hud strong {
-  font-size: 13px;
-}
-
-.dc-overlay-hud span {
-  color: #a9bdd7;
-  font-size: 12px;
-}
-
 .dc-overlay-crosshair {
   position: fixed;
-  z-index: 1;
+  z-index: 2;
   background: rgba(132, 189, 255, 0.45);
   pointer-events: none;
 }
@@ -1290,6 +1565,7 @@ kbd {
 
 .dc-overlay-cancel {
   position: fixed;
+  z-index: 3;
   top: 18px;
   right: 18px;
   height: 34px;
@@ -1300,6 +1576,12 @@ kbd {
   border-radius: 8px;
   color: #fff;
   background: rgba(5, 8, 13, 0.75);
+  transition: opacity 0.16s ease;
+}
+
+.dc-overlay-cancel.dodge {
+  opacity: 0;
+  pointer-events: none;
 }
 
 @media (max-width: 1180px) {
@@ -1365,9 +1647,13 @@ kbd {
   }
 }
 
-@media (max-width: 860px) {
+@media (max-width: 660px) {
   body {
     min-width: 0;
+  }
+
+  .dc-top-caption {
+    display: none;
   }
 
   .dc-root {
@@ -1379,7 +1665,8 @@ kbd {
     border-radius: 0;
   }
 
-  .dc-layout {
+  .dc-layout,
+  .dc-layout.collapsed {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);
     gap: 8px;
@@ -1423,10 +1710,6 @@ kbd {
     padding: 14px;
   }
 
-  .dc-capture-dashboard {
-    grid-template-columns: minmax(228px, 0.7fr) minmax(0, 1.3fr);
-  }
-
   .dc-fullscreen-picker {
     left: 12px;
     right: 12px;
@@ -1454,6 +1737,15 @@ kbd {
   .dc-settings {
     grid-template-columns: 1fr;
   }
+
+  .dc-capture-dashboard {
+    grid-template-rows: auto minmax(220px, 1fr);
+  }
+
+  /* Tight on space: the Queue tab still has the full list. */
+  .dc-queue-card {
+    display: none;
+  }
 }
 
 @media (max-height: 640px) {
@@ -1473,16 +1765,7 @@ kbd {
     margin-bottom: 10px;
   }
 
-  .dc-header h1 {
-    font-size: 30px;
-  }
-
-  .dc-header p {
-    font-size: 13px;
-  }
-
   .dc-profile-card {
-    min-height: 84px;
     padding: 10px;
   }
 
@@ -1491,16 +1774,7 @@ kbd {
     height: 44px;
   }
 
-  .dc-profile-card strong {
-    font-size: 18px;
-  }
-
-  .dc-nav button {
-    height: 42px;
-  }
-
   .dc-connection-card {
-    min-height: 58px;
     padding: 10px;
   }
 
@@ -1541,5 +1815,31 @@ kbd {
   .dc-preview-toolbar {
     right: 10px;
     top: 10px;
+  }
+}
+
+/* Short windows (small screens / heavy display zoom): drop the pending-uploads
+   panel from the Capture tab — the Queue tab still has everything. */
+@media (max-height: 600px) and (min-width: 701px) {
+  .dc-queue-card {
+    display: none;
+  }
+
+  .dc-capture-dashboard {
+    grid-template-rows: minmax(min-content, 1fr);
+  }
+}
+
+@media (max-height: 520px) {
+  .dc-header h1 {
+    font-size: 26px;
+  }
+
+  .dc-header {
+    margin-bottom: 8px;
+  }
+
+  .dc-primary-action {
+    min-height: 84px;
   }
 }

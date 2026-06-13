@@ -1,6 +1,6 @@
 [package]
 name = "dendro_capture"
-version = "0.1.20"
+version = "0.1.28"
 description = "DendroCapture desktop screenshot client"
 authors = ["Dendro Studios"]
 edition = "2021"
@@ -23,11 +23,36 @@ screenshots = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
 thiserror = "2"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_System_Threading",
   "Win32_UI_WindowsAndMessaging"
 ] }
+
+# Image work is far too slow at opt-level 0; keep these fast even in `tauri dev`.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.screenshots]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

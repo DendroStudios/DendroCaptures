@@ -5,13 +5,14 @@ import { emitTo, listen } from '@tauri-apps/api/event';
 import { currentMonitor, cursorPosition, getCurrentWindow, LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { register, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
+import { register, unregister, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
+import { AnnotationEditor, type AnnotationSavePayload } from './annotationEditor';
 import {
   Aperture,
   AlertTriangle,
+  Brush,
   ChevronRight,
   CheckCircle2,
-  Clipboard,
   Cloud,
   Copy,
   Crosshair,
@@ -21,11 +22,12 @@ import {
   Link,
   MoreVertical,
   Minus,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Settings,
   UploadCloud,
   ShieldCheck,
-  Sparkles,
   X,
 } from 'lucide-react';
 import './styles.css';
@@ -70,13 +72,6 @@ interface CaptureRegionRect {
   height: number;
 }
 
-interface CropRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 interface CaptureSettings {
   apiBaseUrl: string;
   areaShortcut: string;
@@ -85,6 +80,7 @@ interface CaptureSettings {
   deviceName: string;
   openAfterUpload: boolean;
   hideDuringCapture: boolean;
+  launchOnStartup: boolean;
 }
 
 interface PendingCapture {
@@ -107,6 +103,15 @@ interface LocalCapture extends PendingCapture {
   filePath?: string;
 }
 
+type EditingCaptureSource = 'latest' | 'history' | 'queue';
+
+interface EditingCapture {
+  source: EditingCaptureSource;
+  item: LocalCapture;
+  imageBase64: string;
+  title: string;
+}
+
 interface LocalCaptureSave {
   filePath: string;
 }
@@ -121,46 +126,49 @@ interface DeviceState {
   publicKey: string;
 }
 
-interface CaptureResultPayload {
-  mode: CaptureMode;
-  capture: NativeCapture;
+interface AreaCaptureSession {
+  width: number;
+  height: number;
+  scaleFactor: number;
+  originX: number;
+  originY: number;
 }
 
-interface CaptureRegionRequestPayload {
-  rect: CaptureRegionRect;
-  qualityScale: number;
-}
-
-interface CaptureSnapshotPayload {
+interface AreaSessionPayload {
   captureId: string;
-  capture: NativeCapture;
+  session: AreaCaptureSession;
+  qualityScale: number;
 }
 
 interface CaptureCropRequestPayload {
   captureId: string;
-  rect: CropRect;
+  rect: CaptureRegionRect;
   qualityScale: number;
 }
 
-const APP_VERSION = '0.1.20';
+const APP_VERSION = '0.1.28';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
 const LOCAL_CAPTURES_KEY = 'dendro-capture:local-captures';
+const SIDEBAR_KEY = 'dendro-capture:sidebar-collapsed';
 const CHUNK_SIZE = 8 * 1024 * 1024;
 const MIN_APP_WIDTH = 740;
-const MIN_APP_HEIGHT = 500;
+const MIN_APP_HEIGHT = 440;
 const MAX_APP_WIDTH = 980;
 const MAX_APP_HEIGHT = 640;
+const DEFAULT_AREA_SHORTCUT = 'Ctrl+Alt+C';
+const OLD_DEFAULT_AREA_SHORTCUT = 'Alt+Shift+4';
 
 const defaultSettings: CaptureSettings = {
   apiBaseUrl: 'http://localhost:3001/api',
-  areaShortcut: 'Alt+Shift+4',
+  areaShortcut: DEFAULT_AREA_SHORTCUT,
   fullscreenShortcut: 'Alt+Shift+5',
   qualityScale: 1,
   deviceName: 'DendroCapture Desktop',
   openAfterUpload: true,
   hideDuringCapture: true,
+  launchOnStartup: true,
 };
 
 const loadJson = <T,>(key: string, fallback: T): T => {
@@ -196,6 +204,58 @@ const saveJson = (key: string, value: unknown) => {
   } catch (error) {
     console.warn(`Could not persist ${key}`, error);
   }
+};
+
+const errorMessage = (error: unknown, fallback = 'Something went wrong'): string => {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  if (error && typeof error === 'object' && 'message' in error) {
+    const message = String((error as { message?: unknown }).message || '').trim();
+    if (message) return message;
+  }
+  return fallback;
+};
+
+const hasPairedDevice = (device: Partial<DeviceState> | null | undefined): device is DeviceState =>
+  Boolean(device?.deviceId?.trim() && device?.publicKey?.trim());
+
+const loadDeviceState = (): DeviceState | null => {
+  const raw = loadJson<Partial<DeviceState> | null>(DEVICE_KEY, null);
+  if (hasPairedDevice(raw)) {
+    return {
+      deviceId: raw.deviceId.trim(),
+      publicKey: raw.publicKey.trim(),
+    };
+  }
+  if (raw) localStorage.removeItem(DEVICE_KEY);
+  return null;
+};
+
+const loadSettings = (): CaptureSettings => {
+  const raw = loadJson<Partial<CaptureSettings>>(SETTINGS_KEY, defaultSettings);
+  // Persisted values can be stale or hand-edited; never let a bad type crash boot.
+  const str = (value: unknown, fallback: string) =>
+    typeof value === 'string' && value.trim() ? value : fallback;
+  const bool = (value: unknown, fallback: boolean) => (typeof value === 'boolean' ? value : fallback);
+  const qualityScale = typeof raw.qualityScale === 'number' && Number.isFinite(raw.qualityScale)
+    ? clampNumber(raw.qualityScale, 0.25, 1)
+    : defaultSettings.qualityScale;
+  const settings: CaptureSettings = {
+    apiBaseUrl: str(raw.apiBaseUrl, defaultSettings.apiBaseUrl),
+    areaShortcut: str(raw.areaShortcut, defaultSettings.areaShortcut),
+    fullscreenShortcut: str(raw.fullscreenShortcut, defaultSettings.fullscreenShortcut),
+    qualityScale,
+    deviceName: str(raw.deviceName, defaultSettings.deviceName),
+    openAfterUpload: bool(raw.openAfterUpload, defaultSettings.openAfterUpload),
+    hideDuringCapture: bool(raw.hideDuringCapture, defaultSettings.hideDuringCapture),
+    launchOnStartup: bool(raw.launchOnStartup, defaultSettings.launchOnStartup),
+  };
+  return {
+    ...settings,
+    areaShortcut: normalizedShortcut(settings.areaShortcut) === OLD_DEFAULT_AREA_SHORTCUT
+      ? DEFAULT_AREA_SHORTCUT
+      : settings.areaShortcut,
+  };
 };
 
 const base64ToBytes = (base64: string): Uint8Array => {
@@ -257,39 +317,6 @@ const loadPendingQueue = (): PendingCapture[] =>
       };
     })
     .slice(0, 20);
-
-const normalizeStoredCapture = (item: Partial<LocalCapture> | Partial<PendingCapture>): PendingCapture | null => {
-  if (typeof item.id !== 'string' || typeof item.mode !== 'string') return null;
-  const mode: CaptureMode = item.mode === 'fullscreen' ? 'fullscreen' : 'area';
-  return {
-    id: String(item.id),
-    mode,
-    capturedAt: typeof item.capturedAt === 'string' ? item.capturedAt : new Date().toISOString(),
-    width: Number(item.width) || 0,
-    height: Number(item.height) || 0,
-    displayWidth: Number(item.displayWidth) || Number(item.width) || 0,
-    displayHeight: Number(item.displayHeight) || Number(item.height) || 0,
-    scaleFactor: Number(item.scaleFactor) || 1,
-    appName: typeof item.appName === 'string' ? item.appName : undefined,
-    windowTitle: typeof item.windowTitle === 'string' ? item.windowTitle : undefined,
-    previewBase64: typeof item.previewBase64 === 'string' && item.previewBase64.length < 300_000
-      ? item.previewBase64
-      : undefined,
-  };
-};
-
-const loadLocalCaptures = (): LocalCapture[] => {
-  const captures: LocalCapture[] = [];
-  for (const item of loadJson<Array<Partial<LocalCapture>>>(LOCAL_CAPTURES_KEY, [])) {
-    const capture = normalizeStoredCapture(item);
-    if (!capture) continue;
-    captures.push({
-      ...capture,
-      ...(typeof item.filePath === 'string' ? { filePath: item.filePath } : {}),
-    });
-  }
-  return captures.slice(0, 80);
-};
 
 const apiUrl = (settings: CaptureSettings, path: string): string => {
   const base = settings.apiBaseUrl.trim().replace(/\/+$/, '');
@@ -357,6 +384,9 @@ const shortcutFromKeyboardEvent = (event: KeyboardEvent): string | null => {
 
 const captureFileName = (date: Date): string =>
   `dendro-capture-${date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}.png`;
+
+const captureId = (date = new Date()): string =>
+  `${date.getTime()}-${Math.random().toString(36).slice(2)}`;
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, ms));
 
@@ -426,54 +456,63 @@ const isDendroCaptureContext = (value: CaptureWindowContext | null | undefined):
   return combined.includes('dendrocapture') || combined.includes('dendro_capture');
 };
 
-const overlayNumberParam = (params: URLSearchParams, key: string, fallback: number): number => {
-  const parsed = Number(params.get(key));
-  return Number.isFinite(parsed) ? parsed : fallback;
-};
-
 const CaptureOverlayApp = () => {
-  const params = useMemo(() => new URLSearchParams(window.location.search), []);
-  const captureId = params.get('captureId') || 'area';
-  const qualityScale = overlayNumberParam(params, 'qualityScale', 1);
-  const [snapshot, setSnapshot] = useState<NativeCapture | null>(null);
+  const [payload, setPayload] = useState<AreaSessionPayload | null>(null);
   const [start, setStart] = useState<{ x: number; y: number } | null>(null);
   const [current, setCurrent] = useState<{ x: number; y: number } | null>(null);
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
   const [finishing, setFinishing] = useState(false);
 
-  useEffect(() => {
-    document.body.classList.add('dc-capture-overlay-body');
-    return () => document.body.classList.remove('dc-capture-overlay-body');
+  const resetSelection = useCallback(() => {
+    setStart(null);
+    setCurrent(null);
+    setPointer(null);
+    setFinishing(false);
   }, []);
 
   useEffect(() => {
-    let unlistenSnapshot: (() => void) | null = null;
+    document.documentElement.classList.add('dc-capture-overlay-page');
+    document.body.classList.add('dc-capture-overlay-body');
+    return () => {
+      document.documentElement.classList.remove('dc-capture-overlay-page');
+      document.body.classList.remove('dc-capture-overlay-body');
+    };
+  }, []);
+
+  useEffect(() => {
     let mounted = true;
+    const unlisteners: Array<() => void> = [];
 
     const boot = async () => {
-      unlistenSnapshot = await listen<CaptureSnapshotPayload>('capture-snapshot', (event) => {
-        if (event.payload.captureId === captureId) setSnapshot(event.payload.capture);
-      });
-      if (mounted) await emitTo('main', 'capture-overlay-ready', captureId);
+      unlisteners.push(await listen<AreaSessionPayload>('capture-snapshot', (event) => {
+        resetSelection();
+        setPayload(event.payload);
+        void emitTo('main', 'capture-overlay-session-ready', event.payload.captureId).catch(() => undefined);
+      }));
+      // The overlay window is kept alive between captures; main tells it to
+      // drop the frozen frame so the multi-megabyte preview can be collected.
+      unlisteners.push(await listen('capture-overlay-reset', () => {
+        resetSelection();
+        setPayload(null);
+      }));
+      if (mounted) await emitTo('main', 'capture-overlay-ready', 'area');
     };
 
     void boot();
     return () => {
       mounted = false;
-      unlistenSnapshot?.();
+      unlisteners.forEach((unlisten) => unlisten());
     };
-  }, [captureId]);
-
-  const closeOverlay = useCallback(async () => {
-    await getCurrentWindow().close().catch(() => undefined);
-  }, []);
+  }, [resetSelection]);
 
   const cancelOverlay = useCallback(async () => {
-    await emitTo('main', 'capture-cancelled', 'area');
-    await closeOverlay();
-  }, [closeOverlay]);
+    resetSelection();
+    await emitTo('main', 'capture-cancelled', 'area').catch(() => undefined);
+  }, [resetSelection]);
 
   useEffect(() => {
+    // Fallback only: the overlay is a no-activate window, so the global
+    // Escape shortcut registered by the main window handles cancellation.
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') void cancelOverlay();
     };
@@ -492,36 +531,59 @@ const CaptureOverlayApp = () => {
   }, [current, start]);
 
   const finishSelection = async () => {
-    if (!selectionBox || finishing || !snapshot) return;
-    if (selectionBox.width < 8 || selectionBox.height < 8) {
+    if (finishing || !payload) return;
+    if (!selectionBox || selectionBox.width < 8 || selectionBox.height < 8) {
       await cancelOverlay();
       return;
     }
 
     setFinishing(true);
-    const scaleX = snapshot.displayWidth / Math.max(1, window.innerWidth);
-    const scaleY = snapshot.displayHeight / Math.max(1, window.innerHeight);
+    const scaleX = payload.session.width / Math.max(1, window.innerWidth);
+    const scaleY = payload.session.height / Math.max(1, window.innerHeight);
     const rect: CaptureRegionRect = {
-      x: snapshot.originX + Math.max(0, Math.round(selectionBox.left * scaleX)),
-      y: snapshot.originY + Math.max(0, Math.round(selectionBox.top * scaleY)),
+      x: payload.session.originX + Math.max(0, Math.round(selectionBox.left * scaleX)),
+      y: payload.session.originY + Math.max(0, Math.round(selectionBox.top * scaleY)),
       width: Math.max(1, Math.round(selectionBox.width * scaleX)),
       height: Math.max(1, Math.round(selectionBox.height * scaleY)),
     };
 
+    // Wait for the now-empty overlay frame to be composited so the selection
+    // chrome can never appear in the captured pixels, even if hiding the
+    // window races the screen grab.
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+    });
+
     try {
-      await emitTo('main', 'capture-region-request', { rect, qualityScale } satisfies CaptureRegionRequestPayload);
-      await closeOverlay();
+      await emitTo('main', 'capture-crop-request', {
+        captureId: payload.captureId,
+        rect,
+        qualityScale: payload.qualityScale,
+      } satisfies CaptureCropRequestPayload);
     } catch (error) {
-      await emitTo('main', 'capture-error', error instanceof Error ? error.message : 'Area capture failed');
-      await closeOverlay();
+      await emitTo('main', 'capture-error', error instanceof Error ? error.message : 'Area capture failed')
+        .catch(() => undefined);
     }
   };
 
+  // While finishing, render nothing at all: a fully transparent window means
+  // the screen grab sees only the real desktop underneath.
+  if (finishing) {
+    return <div className="dc-capture-overlay-root finishing" onContextMenu={(event) => event.preventDefault()} />;
+  }
+
+  const cancelDodged = !!pointer && pointer.x > window.innerWidth - 240 && pointer.y < 150;
+
   return (
     <div
-      className={`dc-capture-overlay-root${finishing ? ' finishing' : ''}`}
+      className="dc-capture-overlay-root"
       onPointerDown={(event) => {
-        if (finishing || !snapshot) return;
+        if (finishing || !payload) return;
+        if (event.button === 2) {
+          void cancelOverlay();
+          return;
+        }
+        if (event.button !== 0) return;
         event.currentTarget.setPointerCapture(event.pointerId);
         const point = clampPoint(event);
         setStart(point);
@@ -529,21 +591,28 @@ const CaptureOverlayApp = () => {
         setPointer(point);
       }}
       onPointerMove={(event) => {
-        if (finishing || !snapshot) return;
+        if (finishing || !payload) return;
         const point = clampPoint(event);
         setPointer(point);
         if (start) setCurrent(point);
       }}
-      onPointerUp={() => void finishSelection()}
+      onPointerUp={(event) => {
+        if (event.button === 0) void finishSelection();
+      }}
+      onContextMenu={(event) => event.preventDefault()}
       onDragStart={(event) => event.preventDefault()}
     >
-      {!selectionBox && <div className="dc-overlay-soft-dim" />}
-      {(!snapshot || !start) && (
-        <div className="dc-overlay-hud">
-          <strong>{finishing ? 'Capturing' : 'Capture area'}</strong>
-          <span>{finishing ? 'Saving selection...' : snapshot ? 'Drag to select. Esc cancels.' : 'Preparing screen snapshot...'}</span>
-        </div>
-      )}
+      <button
+        type="button"
+        className={`dc-overlay-cancel${cancelDodged ? ' dodge' : ''}`}
+        title="press ESC"
+        aria-label="Cancel capture selection. Press ESC."
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={() => void cancelOverlay()}
+      >
+        <X size={16} />
+        Cancel
+      </button>
       {pointer && !selectionBox && (
         <>
           <div className="dc-overlay-crosshair x" style={{ top: pointer.y }} />
@@ -563,15 +632,6 @@ const CaptureOverlayApp = () => {
           <span>{Math.round(selectionBox.width)} x {Math.round(selectionBox.height)}</span>
         </div>
       )}
-      <button
-        type="button"
-        className="dc-overlay-cancel"
-        onPointerDown={(event) => event.stopPropagation()}
-        onClick={() => void cancelOverlay()}
-      >
-        <X size={16} />
-        Cancel
-      </button>
     </div>
   );
 };
@@ -599,16 +659,20 @@ class BootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 }
 
 const DendroCaptureApp = () => {
-  const [settings, setSettings] = useState<CaptureSettings>(() => loadJson(SETTINGS_KEY, defaultSettings));
-  const [device, setDevice] = useState<DeviceState | null>(() => loadJson<DeviceState | null>(DEVICE_KEY, null));
+  const [settings, setSettings] = useState<CaptureSettings>(loadSettings);
+  const [device, setDevice] = useState<DeviceState | null>(loadDeviceState);
   const [pending, setPending] = useState<PendingCapture[]>(loadPendingQueue);
-  const [localCaptures, setLocalCaptures] = useState<LocalCapture[]>(loadLocalCaptures);
+  // History is restored from the local-captures folder on boot (see the
+  // list_local_captures effect below) and updated in memory afterwards.
+  const [localCaptures, setLocalCaptures] = useState<LocalCapture[]>([]);
   const [tab, setTab] = useState<AppTab>('capture');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadJson(SIDEBAR_KEY, false));
   const [pairingCode, setPairingCode] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState('Ready');
   const [lastCapture, setLastCapture] = useState<PendingCapture | null>(null);
   const [lastCaptureImage, setLastCaptureImage] = useState<string | null>(null);
+  const [editingCapture, setEditingCapture] = useState<EditingCapture | null>(null);
   const [recordingShortcut, setRecordingShortcut] = useState<ShortcutField | null>(null);
   const [fullscreenPicker, setFullscreenPicker] = useState<{
     loading: boolean;
@@ -619,7 +683,14 @@ const DendroCaptureApp = () => {
   const deviceRef = useRef(device);
   const busyRef = useRef<string | null>(busy);
   const fitWindowTimerRef = useRef<number | null>(null);
-  const areaSnapshotRef = useRef<CaptureSnapshotPayload | null>(null);
+  const areaSessionRef = useRef<{ captureId: string } | null>(null);
+  const pendingAreaPayloadRef = useRef<AreaSessionPayload | null>(null);
+  const areaDeliveryWatchdogRef = useRef<number | null>(null);
+  const overlayReadyRef = useRef(false);
+  const escapeRegisteredRef = useRef(false);
+  const mainWasVisibleRef = useRef(false);
+  const shortcutOpsRef = useRef<Promise<void>>(Promise.resolve());
+  const editingCaptureRef = useRef(false);
   const activeCaptureContextRef = useRef<CaptureWindowContext | null>(null);
   const lastExternalContextRef = useRef<CaptureWindowContext | null>(null);
   const processCaptureRef = useRef<(
@@ -629,18 +700,17 @@ const DendroCaptureApp = () => {
   ) => Promise<void>>(async () => undefined);
 
   useEffect(() => {
-    const recoverWindow = async () => {
+    const prepareTrayStartup = async () => {
       const win = getCurrentWindow();
       await win.setFullscreen(false).catch(() => undefined);
       await win.setAlwaysOnTop(false).catch(() => undefined);
-      await win.setSkipTaskbar(false).catch(() => undefined);
+      await win.setSkipTaskbar(true).catch(() => undefined);
       await win.setDecorations(false).catch(() => undefined);
       await win.setResizable(false).catch(() => undefined);
       await win.unmaximize().catch(() => undefined);
-      await win.show().catch(() => undefined);
-      await win.setFocus().catch(() => undefined);
+      await win.hide().catch(() => undefined);
     };
-    void recoverWindow();
+    void prepareTrayStartup();
   }, []);
 
   const fitWindowToCurrentMonitor = useCallback(async () => {
@@ -655,6 +725,27 @@ const DendroCaptureApp = () => {
     await win.setSize(new LogicalSize(width, height)).catch(() => undefined);
   }, []);
 
+  const enlargeWindowForEditor = useCallback(async () => {
+    const win = getCurrentWindow();
+    const monitor = await currentMonitor().catch(() => null);
+    const scaleFactor = monitor?.scaleFactor || 1;
+    const workWidth = monitor ? monitor.workArea.size.width / scaleFactor : 1440;
+    const workHeight = monitor ? monitor.workArea.size.height / scaleFactor : 900;
+    const width = Math.round(Math.max(MIN_APP_WIDTH, Math.min(workWidth - 48, 1480)));
+    const height = Math.round(Math.max(MIN_APP_HEIGHT, Math.min(workHeight - 48, 940)));
+    await win.setSize(new LogicalSize(width, height)).catch(() => undefined);
+    await win.center().catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    const isEditing = !!editingCapture;
+    editingCaptureRef.current = isEditing;
+    // Annotating a capture inside the compact app window is cramped; grow to
+    // most of the work area while the editor is open and shrink back after.
+    if (isEditing) void enlargeWindowForEditor();
+    else void fitWindowToCurrentMonitor();
+  }, [!!editingCapture, enlargeWindowForEditor, fitWindowToCurrentMonitor]);
+
   useEffect(() => {
     const win = getCurrentWindow();
     let unlistenMoved: (() => void) | null = null;
@@ -664,6 +755,7 @@ const DendroCaptureApp = () => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
       fitWindowTimerRef.current = window.setTimeout(() => {
         fitWindowTimerRef.current = null;
+        if (editingCaptureRef.current) return;
         void fitWindowToCurrentMonitor();
       }, 520);
     };
@@ -707,13 +799,25 @@ const DendroCaptureApp = () => {
   }, [busy]);
 
   useEffect(() => {
+    // Failures must surface somewhere visible; a swallowed rejection is how
+    // an app ends up looking alive while nothing reacts.
+    const onRejection = (event: PromiseRejectionEvent) => {
+      console.warn('Unhandled rejection', event.reason);
+      const message = errorMessage(event.reason, '');
+      setStatus(message ? `Something went wrong: ${message}` : 'Something went wrong');
+    };
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => window.removeEventListener('unhandledrejection', onRejection);
+  }, []);
+
+  useEffect(() => {
     settingsRef.current = settings;
     saveJson(SETTINGS_KEY, settings);
   }, [settings]);
 
   useEffect(() => {
     deviceRef.current = device;
-    if (device) saveJson(DEVICE_KEY, device);
+    if (hasPairedDevice(device)) saveJson(DEVICE_KEY, device);
     else localStorage.removeItem(DEVICE_KEY);
   }, [device]);
 
@@ -722,8 +826,65 @@ const DendroCaptureApp = () => {
   }, [pending]);
 
   useEffect(() => {
-    saveJson(LOCAL_CAPTURES_KEY, localCaptures.slice(0, 80));
-  }, [localCaptures]);
+    // History used to be persisted in localStorage; clean up data left behind
+    // by older versions.
+    localStorage.removeItem(LOCAL_CAPTURES_KEY);
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const restoreHistory = async () => {
+      try {
+        const records = await invoke<Array<{ metadataJson: string; filePath: string }>>(
+          'list_local_captures',
+          { limit: 60 },
+        );
+        if (!alive || records.length === 0) return;
+        const restored: LocalCapture[] = [];
+        for (const record of records) {
+          try {
+            const meta = JSON.parse(record.metadataJson) as Partial<LocalCapture>;
+            if (typeof meta.id !== 'string' || typeof meta.capturedAt !== 'string') continue;
+            restored.push({
+              id: meta.id,
+              mode: meta.mode === 'fullscreen' ? 'fullscreen' : 'area',
+              capturedAt: meta.capturedAt,
+              width: Number(meta.width) || 0,
+              height: Number(meta.height) || 0,
+              displayWidth: Number(meta.displayWidth) || Number(meta.width) || 0,
+              displayHeight: Number(meta.displayHeight) || Number(meta.height) || 0,
+              scaleFactor: Number(meta.scaleFactor) || 1,
+              appName: typeof meta.appName === 'string' ? meta.appName : undefined,
+              windowTitle: typeof meta.windowTitle === 'string' ? meta.windowTitle : undefined,
+              previewBase64: typeof meta.previewBase64 === 'string' ? meta.previewBase64 : undefined,
+              filePath: record.filePath,
+            });
+          } catch {
+            // Skip captures with unreadable metadata.
+          }
+        }
+        setLocalCaptures((current) => {
+          const known = new Set(current.map((item) => item.id));
+          return [...current, ...restored.filter((item) => !known.has(item.id))].slice(0, 80);
+        });
+      } catch (error) {
+        console.warn('Could not restore capture history', error);
+      }
+    };
+    void restoreHistory();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    saveJson(SIDEBAR_KEY, sidebarCollapsed);
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    invoke(settings.launchOnStartup ? 'plugin:autostart|enable' : 'plugin:autostart|disable')
+      .catch((error) => console.warn('Could not update launch on startup', error));
+  }, [settings.launchOnStartup]);
 
   const updateSettings = (patch: Partial<CaptureSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
@@ -798,8 +959,8 @@ const DendroCaptureApp = () => {
         body: JSON.stringify(body),
       });
     } catch (error) {
-      const reason = error instanceof Error && error.message ? ` (${error.message})` : '';
-      throw new Error(`Could not reach Dendro API at ${apiBaseLabel(settingsRef.current)}${reason}. Check the API URL, server deployment, and capture CORS origins.`);
+      const reason = errorMessage(error, '');
+      throw new Error(`Could not reach Dendro API at ${apiBaseLabel(settingsRef.current)}${reason ? ` (${reason})` : ''}. Check the API URL, server deployment, and capture CORS origins.`);
     }
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `Request failed with ${response.status}`);
@@ -828,15 +989,19 @@ const DendroCaptureApp = () => {
       setPairingCode('');
       setStatus('Device paired');
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Pairing failed');
+      setStatus(errorMessage(error, 'Pairing failed'));
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   };
 
   const captureToken = async (): Promise<string> => {
     const currentDevice = deviceRef.current;
-    if (!currentDevice) throw new Error('Pair DendroCapture before uploading');
+    if (!hasPairedDevice(currentDevice)) {
+      setDevice(null);
+      throw new Error('Pair DendroCapture again before uploading. The saved pairing is missing its device id.');
+    }
     const challenge = await apiPost<{ challengeId: string; challenge: string }>('/capture/auth/challenge', {
       deviceId: currentDevice.deviceId,
     });
@@ -860,13 +1025,138 @@ const DendroCaptureApp = () => {
     setPending((current) => current.filter((item) => item.id !== id));
   };
 
+  const revealCapture = async (item: LocalCapture) => {
+    try {
+      if (item.filePath) await invoke('reveal_in_folder', { path: item.filePath });
+      else await invoke('reveal_pending_capture', { id: item.id });
+    } catch (error) {
+      setStatus(error instanceof Error ? `Could not show in folder: ${error.message}` : 'Could not show in folder');
+    }
+  };
+
   const addLocalCapture = (capture: LocalCapture) => {
     setLocalCaptures((current) => [capture, ...current.filter((item) => item.id !== capture.id)].slice(0, 80));
   };
 
+  const metadataForCapture = (capture: LocalCapture, sourceName: string, operationCount?: number) =>
+    JSON.stringify({
+      ...capture,
+      sourceName,
+      appVersion: APP_VERSION,
+      annotationEditedAt: operationCount ? new Date().toISOString() : undefined,
+      annotationOperationCount: operationCount,
+    });
+
+  const openDrawEditor = async (capture: LocalCapture, source: EditingCaptureSource) => {
+    setStatus('Loading capture editor');
+    try {
+      let imageBase64: string | undefined;
+      if (source === 'latest' && lastCapture?.id === capture.id && lastCaptureImage) {
+        imageBase64 = lastCaptureImage;
+      } else if (capture.filePath) {
+        imageBase64 = await invoke<string>('read_local_capture', { path: capture.filePath });
+      } else {
+        imageBase64 = await invoke<string>('read_pending_capture', { id: capture.id }).catch(() => undefined);
+      }
+      // Never fall back to the 420px preview: editing it and saving with
+      // "replace" would silently overwrite the full-resolution capture.
+      if (!imageBase64) throw new Error('Could not load the original PNG for editing');
+      setEditingCapture({
+        source,
+        item: capture,
+        imageBase64,
+        title: captureTitle(capture),
+      });
+      setStatus('Editing capture');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not open capture editor');
+    }
+  };
+
+  const saveEditedCapture = async ({ pngBase64, replace, operationCount }: AnnotationSavePayload) => {
+    if (!editingCapture) return;
+    const base = editingCapture.item;
+    const now = new Date();
+    const targetDate = replace ? new Date(base.capturedAt) : now;
+    const previewBase64 = await capturePreviewBase64(pngBase64).catch(() => undefined);
+    const target: LocalCapture = {
+      ...base,
+      id: replace ? base.id : captureId(now),
+      capturedAt: replace ? base.capturedAt : now.toISOString(),
+      previewBase64,
+      filePath: replace ? base.filePath : undefined,
+    };
+    const sourceName = replace && base.filePath
+      ? base.filePath.split(/[\\/]/).pop() || captureFileName(targetDate)
+      : captureFileName(targetDate);
+
+    await invoke('copy_png_to_clipboard', { pngBase64 }).catch((error) => {
+      console.warn('Could not copy edited capture to clipboard', error);
+    });
+    setLastCapture(target);
+    setLastCaptureImage(pngBase64);
+
+    if (hasPairedDevice(deviceRef.current)) {
+      const uploadItem: PendingCapture = { ...target };
+      await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
+        console.warn('Could not persist edited pending capture', error);
+      });
+      addPending(uploadItem);
+      setEditingCapture(null);
+      setStatus('Uploading edited capture');
+      try {
+        await uploadCapture({ ...uploadItem, pngBase64 });
+        setStatus('Edited capture uploaded');
+      } catch (error) {
+        setStatus(`Edited capture queued: ${errorMessage(error, 'Upload failed')}`);
+      }
+      return;
+    }
+
+    if (replace && base.filePath) {
+      const saved = await invoke<LocalCaptureSave>('overwrite_local_capture', {
+        path: base.filePath,
+        pngBase64,
+        metadataJson: metadataForCapture(target, sourceName, operationCount),
+      });
+      const replaced = { ...target, filePath: saved.filePath };
+      setLocalCaptures((current) => {
+        const exists = current.some((item) => item.id === base.id);
+        const next = exists
+          ? current.map((item) => (item.id === base.id ? replaced : item))
+          : [replaced, ...current];
+        return next.slice(0, 80);
+      });
+      setLastCapture(replaced);
+      setStatus('Edited image replaced current capture');
+    } else {
+      const saved = await invoke<LocalCaptureSave>('save_local_capture', {
+        filename: sourceName,
+        pngBase64,
+        metadataJson: metadataForCapture(target, sourceName, operationCount),
+      });
+      const savedCapture = { ...target, filePath: saved.filePath };
+      addLocalCapture(savedCapture);
+      setLastCapture(savedCapture);
+      setStatus(replace ? 'Edited image saved locally' : 'Edited image saved as new capture');
+    }
+    setEditingCapture(null);
+  };
+
   const uploadCapture = async (capture: UploadableCapture) => {
-    const token = await captureToken();
-    const pngBase64 = capture.pngBase64 || await invoke<string>('read_pending_capture', { id: capture.id });
+    const uploadStep = async <T,>(label: string, action: () => Promise<T>): Promise<T> => {
+      try {
+        return await action();
+      } catch (error) {
+        throw new Error(`${label} failed: ${errorMessage(error, 'Unknown error')}`);
+      }
+    };
+
+    const token = await uploadStep('Authorize upload', captureToken);
+    const pngBase64 = capture.pngBase64 || await uploadStep(
+      'Read queued capture',
+      () => invoke<string>('read_pending_capture', { id: capture.id })
+    );
     const bytes = base64ToBytes(pngBase64);
     const platform = await platformLabel();
     const sourceName = captureFileName(new Date(capture.capturedAt));
@@ -874,49 +1164,61 @@ const DendroCaptureApp = () => {
     const windowTitle = capture.windowTitle?.trim();
     const displayName = appName || windowTitle || 'Desktop';
     const extraTags = [displayName, appName, windowTitle].filter((tag): tag is string => Boolean(tag));
-    const upload = await apiPost<{
-      uploadId: string;
-      chunkSize: number;
-    }>('/capture/assets/uploads', {
-      sourceName,
-      expectedSize: bytes.byteLength,
-      capturedAt: capture.capturedAt,
-      captureMode: capture.mode,
-      width: capture.width,
-      height: capture.height,
-      displayWidth: capture.displayWidth,
-      displayHeight: capture.displayHeight,
-      scaleFactor: capture.scaleFactor,
-      qualityScale: settingsRef.current.qualityScale,
-      platform,
-      appVersion: APP_VERSION,
-      appName,
-      windowTitle,
-      displayName,
-      tags: ['desktop', platform, ...extraTags],
-    }, token);
+    const upload = await uploadStep('Create upload session', () =>
+      apiPost<{
+        uploadId: string;
+        chunkSize: number;
+      }>('/capture/assets/uploads', {
+        sourceName,
+        expectedSize: bytes.byteLength,
+        capturedAt: capture.capturedAt,
+        captureMode: capture.mode,
+        width: capture.width,
+        height: capture.height,
+        displayWidth: capture.displayWidth,
+        displayHeight: capture.displayHeight,
+        scaleFactor: capture.scaleFactor,
+        qualityScale: settingsRef.current.qualityScale,
+        platform,
+        appVersion: APP_VERSION,
+        appName,
+        windowTitle,
+        displayName,
+        tags: ['desktop', platform, ...extraTags],
+      }, token)
+    );
 
     const chunkSize = upload.chunkSize || CHUNK_SIZE;
+    const totalChunks = Math.max(1, Math.ceil(bytes.byteLength / chunkSize));
     for (let offset = 0, chunkIndex = 0; offset < bytes.byteLength; offset += chunkSize, chunkIndex += 1) {
-      const chunk = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
-      const response = await fetch(apiUrl(settingsRef.current, `/capture/assets/uploads/${encodeURIComponent(upload.uploadId)}/chunks/${chunkIndex}`), {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          Authorization: `Bearer ${token}`,
-        },
-        body: chunk,
+      await uploadStep(`Upload chunk ${chunkIndex + 1}/${totalChunks}`, async () => {
+        const chunk = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
+        let response: Response;
+        try {
+          response = await fetch(apiUrl(settingsRef.current, `/capture/assets/uploads/${encodeURIComponent(upload.uploadId)}/chunks/${chunkIndex}`), {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              Authorization: `Bearer ${token}`,
+            },
+            body: chunk,
+          });
+        } catch (error) {
+          throw new Error(`Could not reach Dendro API at ${apiBaseLabel(settingsRef.current)} (${errorMessage(error, 'network error')})`);
+        }
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.error || `Chunk upload failed with ${response.status}`);
+        }
       });
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || `Chunk upload failed with ${response.status}`);
-      }
     }
 
     const sha256 = await sha256Hex(bytes);
-    const finalized = await apiPost<{ openUrl?: string }>('/capture/assets/uploads/' + encodeURIComponent(upload.uploadId) + '/finalize', {
-      sha256,
-    }, token);
+    const finalized = await uploadStep('Finalize upload', () =>
+      apiPost<{ openUrl?: string }>('/capture/assets/uploads/' + encodeURIComponent(upload.uploadId) + '/finalize', {
+        sha256,
+      }, token)
+    );
     removePending(capture.id);
     await invoke('delete_pending_capture', { id: capture.id }).catch(() => undefined);
     if (finalized.openUrl && settingsRef.current.openAfterUpload) {
@@ -929,7 +1231,7 @@ const DendroCaptureApp = () => {
     const cleanContext = cleanCaptureContext(context);
     const sourceName = captureFileName(now);
     const item: PendingCapture = {
-      id: `${now.getTime()}-${Math.random().toString(36).slice(2)}`,
+      id: captureId(now),
       mode,
       capturedAt: now.toISOString(),
       width: capture.width,
@@ -940,15 +1242,21 @@ const DendroCaptureApp = () => {
       appName: cleanContext?.appName || undefined,
       windowTitle: cleanContext?.windowTitle || undefined,
     };
-    setStatus('Copied PNG to clipboard');
-    await invoke('copy_png_to_clipboard', { pngBase64: capture.pngBase64 });
+    try {
+      await invoke('copy_png_to_clipboard', { pngBase64: capture.pngBase64 });
+      setStatus('Copied PNG to clipboard');
+    } catch (error) {
+      // A clipboard hiccup must never lose the capture itself.
+      console.warn('Could not copy capture to clipboard', error);
+      setStatus('Capture ready, clipboard copy failed');
+    }
     setLastCaptureImage(capture.pngBase64);
     const queuedItem = {
       ...item,
       previewBase64: await capturePreviewBase64(capture.pngBase64).catch(() => undefined),
     };
     setLastCapture(queuedItem);
-    if (!deviceRef.current) {
+    if (!hasPairedDevice(deviceRef.current)) {
       try {
         const saved = await invoke<LocalCaptureSave>('save_local_capture', {
           filename: sourceName,
@@ -959,11 +1267,13 @@ const DendroCaptureApp = () => {
             appVersion: APP_VERSION,
           }),
         });
-        addLocalCapture({ ...queuedItem, filePath: saved.filePath });
+        const savedCapture = { ...queuedItem, filePath: saved.filePath };
+        addLocalCapture(savedCapture);
+        setLastCapture(savedCapture);
         setStatus('Saved locally');
       } catch (error) {
         addLocalCapture(queuedItem);
-        setStatus(error instanceof Error ? `Copied PNG, local save failed: ${error.message}` : 'Copied PNG locally');
+        setStatus(`Copied PNG, local save failed: ${errorMessage(error, 'Unknown error')}`);
       }
       return;
     }
@@ -976,7 +1286,7 @@ const DendroCaptureApp = () => {
       await uploadCapture({ ...queuedItem, pngBase64: capture.pngBase64 });
       setStatus('Capture uploaded');
     } catch (error) {
-      setStatus(error instanceof Error ? `Queued: ${error.message}` : 'Upload failed and was queued');
+      setStatus(`Queued: ${errorMessage(error, 'Upload failed')}`);
     }
   };
 
@@ -996,86 +1306,202 @@ const DendroCaptureApp = () => {
     await win.setFocus().catch(() => undefined);
   }, []);
 
-  const hideMainWindowForCapture = useCallback(async () => {
-    if (!settingsRef.current.hideDuringCapture) return;
+  const hideMainWindowForCapture = useCallback(async (force = false) => {
     const win = getCurrentWindow();
+    const visible = await win.isVisible().catch(() => false);
+    mainWasVisibleRef.current = visible;
+    if (!visible || (!force && !settingsRef.current.hideDuringCapture)) return;
     await win.setSkipTaskbar(true).catch(() => undefined);
     await win.hide().catch(() => undefined);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (!(await win.isVisible().catch(() => false))) break;
+      await wait(60);
+      await win.hide().catch(() => undefined);
+    }
+    // Give the compositor a moment so the app is not in the snapshot.
+    await wait(180);
   }, []);
+
+  const restoreMainWindowAfterCancel = useCallback(async () => {
+    if (mainWasVisibleRef.current) await showMainWindow();
+  }, [showMainWindow]);
+
+  const unregisterEscapeCancel = useCallback(async () => {
+    if (!escapeRegisteredRef.current) return;
+    escapeRegisteredRef.current = false;
+    await unregister('Escape').catch(() => undefined);
+  }, []);
+
+  const clearAreaDeliveryWatchdog = useCallback(() => {
+    if (areaDeliveryWatchdogRef.current === null) return;
+    window.clearTimeout(areaDeliveryWatchdogRef.current);
+    areaDeliveryWatchdogRef.current = null;
+  }, []);
+
+  const teardownAreaCapture = useCallback(async () => {
+    clearAreaDeliveryWatchdog();
+    areaSessionRef.current = null;
+    pendingAreaPayloadRef.current = null;
+    await unregisterEscapeCancel();
+    const overlay = await WebviewWindow.getByLabel('capture-overlay').catch(() => null);
+    await overlay?.hide().catch(() => undefined);
+    await emitTo('capture-overlay', 'capture-overlay-reset', null).catch(() => undefined);
+  }, [clearAreaDeliveryWatchdog, unregisterEscapeCancel]);
+
+  const recoverStaleAreaCapture = useCallback(async (captureId: string, message: string) => {
+    if (areaSessionRef.current?.captureId !== captureId) return;
+    activeCaptureContextRef.current = null;
+    await teardownAreaCapture();
+    await restoreMainWindowAfterCancel();
+    busyRef.current = null;
+    setBusy(null);
+    setStatus(message);
+  }, [restoreMainWindowAfterCancel, teardownAreaCapture]);
+
+  const armAreaDeliveryWatchdog = useCallback((captureId: string) => {
+    clearAreaDeliveryWatchdog();
+    areaDeliveryWatchdogRef.current = window.setTimeout(() => {
+      void recoverStaleAreaCapture(captureId, 'The capture overlay did not start. Please try again.');
+    }, 3500);
+  }, [clearAreaDeliveryWatchdog, recoverStaleAreaCapture]);
+
+  const cancelAreaCapture = useCallback(async () => {
+    if (!areaSessionRef.current) return;
+    activeCaptureContextRef.current = null;
+    await teardownAreaCapture();
+    await restoreMainWindowAfterCancel();
+    busyRef.current = null;
+    setBusy(null);
+    setStatus('Area capture canceled');
+  }, [restoreMainWindowAfterCancel, teardownAreaCapture]);
+
+  const registerEscapeCancel = useCallback(async () => {
+    if (escapeRegisteredRef.current) return;
+    escapeRegisteredRef.current = true;
+    try {
+      // The overlay is a no-activate window (it never takes keyboard focus,
+      // so the captured app is not disturbed); Escape must be global.
+      await register('Escape', (event) => {
+        if (event.state === 'Pressed') void cancelAreaCapture();
+      });
+    } catch {
+      escapeRegisteredRef.current = false;
+    }
+  }, [cancelAreaCapture]);
+
+  const ensureOverlayWindow = useCallback(async (): Promise<{ createdNow: boolean }> => {
+    const existing = await WebviewWindow.getByLabel('capture-overlay').catch(() => null);
+    if (existing) return { createdNow: false };
+    overlayReadyRef.current = false;
+    const overlay = new WebviewWindow('capture-overlay', {
+      url: '/?captureOverlay=area',
+      x: 0,
+      y: 0,
+      width: 32,
+      height: 32,
+      decorations: false,
+      transparent: true,
+      alwaysOnTop: true,
+      resizable: false,
+      skipTaskbar: true,
+      visible: false,
+      focus: false,
+      focusable: false,
+      shadow: false,
+      backgroundColor: '#00000000',
+      title: '',
+    });
+    await new Promise<void>((resolve, reject) => {
+      void overlay.once('tauri://created', () => resolve());
+      void overlay.once('tauri://error', (event) => {
+        reject(new Error(typeof event.payload === 'string' ? event.payload : 'Could not open capture overlay'));
+      });
+    });
+    void overlay.once('tauri://destroyed', () => {
+      overlayReadyRef.current = false;
+    });
+    // Layered 254/255 alpha: browsers under the overlay keep playing video
+    // because Chromium's occlusion tracker ignores translucent windows.
+    await invoke('prepare_overlay_window').catch((error) => {
+      console.warn('Could not configure the capture overlay window', error);
+    });
+    return { createdNow: true };
+  }, []);
+
+  // Warm the overlay window at startup so the first capture does not pay the
+  // webview cold-start; it stays hidden and is reused for every capture.
+  useEffect(() => {
+    void ensureOverlayWindow().catch(() => undefined);
+  }, [ensureOverlayWindow]);
+
+  const deliverAreaSession = useCallback(async (payload: AreaSessionPayload) => {
+    const overlay = await WebviewWindow.getByLabel('capture-overlay').catch(() => null);
+    if (!overlay) throw new Error('Could not open capture overlay');
+    await overlay.setPosition(new PhysicalPosition(payload.session.originX, payload.session.originY)).catch(() => undefined);
+    await overlay.setSize(new PhysicalSize(payload.session.width, payload.session.height)).catch(() => undefined);
+    // Idempotent; re-applied before each show in case the windowing layer
+    // reset the layered style since creation.
+    await invoke('prepare_overlay_window').catch(() => undefined);
+    armAreaDeliveryWatchdog(payload.captureId);
+    await emitTo('capture-overlay', 'capture-snapshot', payload).catch(() => undefined);
+    const shown = await overlay.show().then(() => true).catch(() => false);
+    if (!shown) {
+      await recoverStaleAreaCapture(payload.captureId, 'Could not show the capture overlay. Please try again.');
+      return;
+    }
+    setStatus('Drag an area to capture. Esc cancels');
+  }, [armAreaDeliveryWatchdog, recoverStaleAreaCapture]);
 
   useEffect(() => {
     const subscriptions = [
-      listen<CaptureResultPayload>('capture-result', async (event) => {
-        await showMainWindow();
-        setBusy(null);
-        setStatus('Processing capture');
-        const context = activeCaptureContextRef.current;
-        activeCaptureContextRef.current = null;
-        await processCaptureRef.current(event.payload.mode, event.payload.capture, context);
-      }),
-      listen<CaptureRegionRequestPayload>('capture-region-request', async (event) => {
-        setStatus('Capturing selected area');
-        const context = activeCaptureContextRef.current;
-        activeCaptureContextRef.current = null;
-        try {
-          await wait(220);
-          const capture = await invoke<NativeCapture>('capture_region', {
-            rect: event.payload.rect,
-            qualityScale: event.payload.qualityScale,
-          });
-          await showMainWindow();
-          setBusy(null);
-          setStatus('Processing capture');
-          await processCaptureRef.current('area', capture, context);
-        } catch (error) {
-          await showMainWindow();
-          setBusy(null);
-          setStatus(error instanceof Error ? error.message : 'Area capture failed');
+      listen<string>('capture-overlay-ready', async () => {
+        overlayReadyRef.current = true;
+        const payload = pendingAreaPayloadRef.current;
+        pendingAreaPayloadRef.current = null;
+        if (payload && areaSessionRef.current?.captureId === payload.captureId) {
+          await deliverAreaSession(payload);
         }
       }),
-      listen<string>('capture-overlay-ready', async (event) => {
-        const snapshot = areaSnapshotRef.current;
-        if (!snapshot || snapshot.captureId !== event.payload) return;
-        await emitTo('capture-overlay', 'capture-snapshot', snapshot).catch(() => undefined);
+      listen<string>('capture-overlay-session-ready', (event) => {
+        if (areaSessionRef.current?.captureId === event.payload) {
+          clearAreaDeliveryWatchdog();
+        }
       }),
       listen<CaptureCropRequestPayload>('capture-crop-request', async (event) => {
-        setStatus('Cropping selected area');
-        const snapshot = areaSnapshotRef.current;
-        areaSnapshotRef.current = null;
+        const session = areaSessionRef.current;
+        if (!session || session.captureId !== event.payload.captureId) return;
         const context = activeCaptureContextRef.current;
         activeCaptureContextRef.current = null;
+        setStatus('Capturing selected area');
+        // Hide the overlay, give the compositor a beat to remove it from the
+        // screen, then grab the selected region live - Gyazo style.
+        await teardownAreaCapture();
         try {
-          if (!snapshot || snapshot.captureId !== event.payload.captureId) {
-            throw new Error('Capture snapshot expired. Please try again.');
-          }
-
-          await wait(80);
-          const capture = await invoke<NativeCapture>('crop_capture', {
-            pngBase64: snapshot.capture.pngBase64,
+          await wait(140);
+          const capture = await invoke<NativeCapture>('finish_area_capture', {
             rect: event.payload.rect,
             qualityScale: event.payload.qualityScale,
           });
           await showMainWindow();
+          busyRef.current = null;
           setBusy(null);
           setStatus('Processing capture');
           await processCaptureRef.current('area', capture, context);
         } catch (error) {
           await showMainWindow();
+          busyRef.current = null;
           setBusy(null);
           setStatus(error instanceof Error ? error.message : 'Area capture failed');
         }
       }),
       listen<string>('capture-cancelled', async () => {
-        areaSnapshotRef.current = null;
-        activeCaptureContextRef.current = null;
-        await showMainWindow();
-        setBusy(null);
-        setStatus('Area capture canceled');
+        await cancelAreaCapture();
       }),
       listen<string>('capture-error', async (event) => {
-        areaSnapshotRef.current = null;
         activeCaptureContextRef.current = null;
-        await showMainWindow();
+        await teardownAreaCapture();
+        await restoreMainWindowAfterCancel();
+        busyRef.current = null;
         setBusy(null);
         setStatus(event.payload || 'Capture failed');
       }),
@@ -1085,72 +1511,65 @@ const DendroCaptureApp = () => {
         void subscription.then((unlisten) => unlisten()).catch(() => undefined);
       });
     };
-  }, [showMainWindow]);
+  }, [cancelAreaCapture, clearAreaDeliveryWatchdog, deliverAreaSession, restoreMainWindowAfterCancel, showMainWindow, teardownAreaCapture]);
 
   const startAreaCapture = useCallback(async () => {
     if (busyRef.current) return;
+    busyRef.current = 'area';
     setBusy('area');
     setFullscreenPicker(null);
     setStatus('Opening capture overlay');
     try {
-      const staleOverlay = await WebviewWindow.getByLabel('capture-overlay').catch(() => null);
       const cursor = await cursorPosition().catch(() => null);
-      await staleOverlay?.close().catch(() => undefined);
-      await hideMainWindowForCapture();
-      await wait(260);
+      const overlayPromise = ensureOverlayWindow();
+      // Always hide for area captures: the app window would otherwise end up
+      // inside the captured region.
+      await hideMainWindowForCapture(true);
       activeCaptureContextRef.current = await readActiveWindowContext();
-      const snapshot = await invoke<NativeCapture>('prepare_area_overlay_for_point', {
+      const captureId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const session = await invoke<AreaCaptureSession>('begin_area_capture', {
         cursorX: cursor ? Math.round(cursor.x) : null,
         cursorY: cursor ? Math.round(cursor.y) : null,
       });
-      const captureId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      areaSnapshotRef.current = { captureId, capture: snapshot };
-      const params = new URLSearchParams({
-        captureOverlay: 'area',
-        captureId,
-        qualityScale: String(settingsRef.current.qualityScale),
-      });
-      const overlayWindow = new WebviewWindow('capture-overlay', {
-        url: `/?${params.toString()}`,
-        x: 0,
-        y: 0,
-        width: 32,
-        height: 32,
-        decorations: false,
-        transparent: true,
-        alwaysOnTop: true,
-        resizable: false,
-        skipTaskbar: true,
-        visible: false,
-        focus: false,
-        shadow: false,
-        title: 'DendroCapture Area',
-      });
-      overlayWindow.once('tauri://created', async () => {
-        await overlayWindow.setPosition(new PhysicalPosition(snapshot.originX, snapshot.originY)).catch(() => undefined);
-        await overlayWindow.setSize(new PhysicalSize(snapshot.displayWidth, snapshot.displayHeight)).catch(() => undefined);
-        await overlayWindow.show().catch(() => undefined);
-        await overlayWindow.setFocus().catch(() => undefined);
-        setStatus('Drag an area to capture');
-      });
-      overlayWindow.once('tauri://error', async (event) => {
-        areaSnapshotRef.current = null;
-        activeCaptureContextRef.current = null;
-        await showMainWindow();
-        setBusy(null);
-        setStatus(typeof event.payload === 'string' ? event.payload : 'Could not open capture overlay');
-      });
+      const { createdNow } = await overlayPromise;
+      areaSessionRef.current = { captureId };
+      const payload: AreaSessionPayload = { captureId, session, qualityScale: settingsRef.current.qualityScale };
+      await registerEscapeCancel();
+      if (!createdNow || overlayReadyRef.current) {
+        await deliverAreaSession(payload);
+      } else {
+        // Freshly created window: its page is still booting; the
+        // capture-overlay-ready listener delivers the payload.
+        pendingAreaPayloadRef.current = payload;
+        // Watchdog: never leave the app stuck busy and hidden if the overlay
+        // page fails to boot.
+        window.setTimeout(() => {
+          if (pendingAreaPayloadRef.current?.captureId !== captureId) return;
+          void recoverStaleAreaCapture(captureId, 'The capture overlay did not start. Please try again.');
+        }, 6000);
+      }
     } catch (error) {
-      areaSnapshotRef.current = null;
       activeCaptureContextRef.current = null;
-      await showMainWindow();
-      setStatus(error instanceof Error ? error.message : 'Area capture failed');
+      await teardownAreaCapture();
+      await restoreMainWindowAfterCancel();
+      busyRef.current = null;
       setBusy(null);
+      setStatus(error instanceof Error ? error.message : 'Area capture failed');
     }
-  }, [hideMainWindowForCapture, readActiveWindowContext, showMainWindow]);
+  }, [
+    deliverAreaSession,
+    ensureOverlayWindow,
+    hideMainWindowForCapture,
+    readActiveWindowContext,
+    registerEscapeCancel,
+    recoverStaleAreaCapture,
+    restoreMainWindowAfterCancel,
+    teardownAreaCapture,
+  ]);
 
   const openFullscreenPicker = useCallback(async () => {
     if (busyRef.current) return;
+    busyRef.current = 'fullscreen-picker';
     setBusy('fullscreen-picker');
     setStatus('Loading display previews');
     setFullscreenPicker({ loading: true, previews: [] });
@@ -1166,51 +1585,69 @@ const DendroCaptureApp = () => {
       });
       setStatus(error instanceof Error ? error.message : 'Could not load display previews');
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   }, []);
 
   const captureSelectedDisplay = async (preview: MonitorPreview) => {
     setFullscreenPicker(null);
+    busyRef.current = `fullscreen-${preview.monitor.id}`;
     setBusy(`fullscreen-${preview.monitor.id}`);
     setStatus(preview.monitor.isPrimary ? 'Capturing primary display' : 'Capturing display');
     try {
       await hideMainWindowForCapture();
-      await wait(420);
+      await wait(240);
       const context = await readActiveWindowContext();
-      await wait(120);
       const capture = await invoke<NativeCapture>('capture_display', {
         monitorId: preview.monitor.id,
         qualityScale: settingsRef.current.qualityScale,
       });
       await showMainWindow();
+      busyRef.current = null;
+      setBusy(null);
+      setStatus('Processing capture');
       await processCapture('fullscreen', capture, context);
     } catch (error) {
       await showMainWindow();
       setStatus(error instanceof Error ? error.message : 'Fullscreen capture failed');
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   };
 
   useEffect(() => {
     let alive = true;
-    const bind = async () => {
+    // All register/unregister calls are chained so a cleanup's unregisterAll
+    // can never land after (and silently wipe) the next bind's registrations.
+    shortcutOpsRef.current = shortcutOpsRef.current.then(async () => {
       await unregisterAll().catch(() => undefined);
-      if (recordingShortcut) return;
-      if (!alive) return;
-      await register(normalizedShortcut(settings.areaShortcut), () => void startAreaCapture()).catch(() => undefined);
-      await register(normalizedShortcut(settings.fullscreenShortcut), () => void openFullscreenPicker()).catch(() => undefined);
-    };
-    void bind();
+      escapeRegisteredRef.current = false;
+      if (!alive || recordingShortcut) return;
+      const bindings: Array<[string, () => void]> = [
+        [normalizedShortcut(settings.areaShortcut), () => void startAreaCapture()],
+        [normalizedShortcut(settings.fullscreenShortcut), () => void openFullscreenPicker()],
+      ];
+      for (const [shortcut, action] of bindings) {
+        await register(shortcut, (event) => {
+          if (event.state === 'Pressed') action();
+        }).catch(() => {
+          setStatus(`Could not register ${shortcut}. It may be in use by another app`);
+        });
+      }
+    });
     return () => {
       alive = false;
-      void unregisterAll().catch(() => undefined);
+      shortcutOpsRef.current = shortcutOpsRef.current.then(async () => {
+        await unregisterAll().catch(() => undefined);
+        escapeRegisteredRef.current = false;
+      });
     };
   }, [settings.areaShortcut, settings.fullscreenShortcut, recordingShortcut, startAreaCapture, openFullscreenPicker]);
 
   const retryPending = async (capture: PendingCapture) => {
-    if (!deviceRef.current) {
+    if (!hasPairedDevice(deviceRef.current)) {
       setStatus('Pair DendroCapture before retrying queued uploads');
       return;
     }
@@ -1220,14 +1657,15 @@ const DendroCaptureApp = () => {
       await uploadCapture(capture);
       setStatus('Queued capture uploaded');
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Retry failed');
+      setStatus(errorMessage(error, 'Retry failed'));
     } finally {
+      busyRef.current = null;
       setBusy(null);
     }
   };
 
   const retryAllPending = async () => {
-    if (!deviceRef.current) {
+    if (!hasPairedDevice(deviceRef.current)) {
       setStatus('Pair DendroCapture before retrying queued uploads');
       return;
     }
@@ -1239,8 +1677,12 @@ const DendroCaptureApp = () => {
 
   const copyLastCapture = async () => {
     if (!lastCaptureImage) return;
-    await invoke('copy_png_to_clipboard', { pngBase64: lastCaptureImage });
-    setStatus('Copied last capture to clipboard');
+    try {
+      await invoke('copy_png_to_clipboard', { pngBase64: lastCaptureImage });
+      setStatus('Copied last capture to clipboard');
+    } catch (error) {
+      setStatus(`Copy failed: ${errorMessage(error, 'Unknown error')}`);
+    }
   };
 
   const minimizeWindow = async () => {
@@ -1261,11 +1703,20 @@ const DendroCaptureApp = () => {
   ];
   const latestCapture = lastCapture || localCaptures[0] || pending[0] || null;
   const latestPreview = lastCaptureImage || latestCapture?.previewBase64;
+  const pairedDevice = hasPairedDevice(device) ? device : null;
 
   return (
     <div className="dc-root">
       <div className="dc-shell">
         <header className="dc-topbar">
+          <button
+            type="button"
+            className="dc-top-icon"
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          </button>
           <div className="dc-top-drag-zone" data-tauri-drag-region>
             <div className="dc-top-brand" data-tauri-drag-region>
               <img src="/dendro-capture.png" alt="" />
@@ -1276,11 +1727,11 @@ const DendroCaptureApp = () => {
           <div className="dc-top-spacer" />
           <button
             type="button"
-            className={`dc-top-status${device ? ' paired' : ' unpaired'}`}
+            className={`dc-top-status${pairedDevice ? ' paired' : ' unpaired'}`}
             onClick={() => setTab('settings')}
           >
-            {device ? <ShieldCheck size={15} /> : <AlertTriangle size={15} />}
-            <span>{device ? 'Paired' : 'Not paired'}</span>
+            {pairedDevice ? <ShieldCheck size={15} /> : <AlertTriangle size={15} />}
+            <span>{pairedDevice ? 'Paired' : 'Not paired'}</span>
           </button>
           <button type="button" className="dc-top-icon" onClick={() => setTab('settings')} aria-label="Settings">
             <Settings size={18} />
@@ -1295,13 +1746,13 @@ const DendroCaptureApp = () => {
           </div>
         </header>
 
-        <div className="dc-layout">
+        <div className={`dc-layout${sidebarCollapsed ? ' collapsed' : ''}`}>
           <aside className="dc-sidebar">
             <div className="dc-profile-card">
               <img src="/dendro-capture.png" alt="" />
               <span>
                 <strong>DendroCapture</strong>
-                <small>Screenshot to <b>{device ? 'Dendro Assets' : 'local storage'}</b></small>
+                <small>Screenshot to <b>{pairedDevice ? 'Dendro Assets' : 'local storage'}</b></small>
               </span>
             </div>
             <nav className="dc-nav">
@@ -1318,11 +1769,11 @@ const DendroCaptureApp = () => {
                 </button>
               ))}
             </nav>
-            <button type="button" className={`dc-connection-card${device ? ' paired' : ' unpaired'}`} onClick={() => setTab('settings')}>
+            <button type="button" className={`dc-connection-card${pairedDevice ? ' paired' : ' unpaired'}`} onClick={() => setTab('settings')}>
               <span className="dc-connection-dot" />
               <span>
-                <strong>{device ? 'Paired device' : 'Not paired'}</strong>
-                <small>{device ? 'Connected to Dendro Assets' : 'Saving captures locally'}</small>
+                <strong>{pairedDevice ? 'Paired device' : 'Not paired'}</strong>
+                <small>{pairedDevice ? 'Connected to Dendro Assets' : 'Saving captures locally'}</small>
               </span>
               <ChevronRight size={17} />
             </button>
@@ -1336,7 +1787,7 @@ const DendroCaptureApp = () => {
               </div>
               <div className="dc-status-pill">
                 <Cloud size={14} />
-                {device ? settings.apiBaseUrl.replace(/^https?:\/\//, '') : 'Local mode'}
+                {pairedDevice ? settings.apiBaseUrl.replace(/^https?:\/\//, '') : 'Local mode'}
               </div>
             </header>
 
@@ -1345,7 +1796,7 @@ const DendroCaptureApp = () => {
                 <div className="dc-action-column">
                   <button type="button" className="dc-primary-action" onClick={() => void startAreaCapture()} disabled={!!busy}>
                     <span className="dc-action-icon dc-action-image-icon">
-                      <img src="/capture-area-icon.png" alt="" />
+                      <img src="/capture-area.svg" alt="" />
                     </span>
                     <span className="dc-action-copy">
                       <strong>Capture Area</strong>
@@ -1356,7 +1807,7 @@ const DendroCaptureApp = () => {
                   <div className="dc-action-slot">
                     <button type="button" className="dc-primary-action secondary" onClick={() => void openFullscreenPicker()} disabled={!!busy}>
                       <span className="dc-action-icon dc-action-image-icon">
-                        <img src="/capture-fullscreen-icon.png" alt="" />
+                        <img src="/capture-fullscreen.svg" alt="" />
                       </span>
                       <span className="dc-action-copy">
                         <strong>Capture Fullscreen</strong>
@@ -1401,6 +1852,14 @@ const DendroCaptureApp = () => {
                     </div>
                   )}
                   <div className="dc-preview-toolbar">
+                    <button
+                      type="button"
+                      disabled={!latestCapture || !latestPreview}
+                      title="Draw"
+                      onClick={() => { if (latestCapture) void openDrawEditor(latestCapture, 'latest'); }}
+                    >
+                      <Brush size={16} />
+                    </button>
                     <button type="button" disabled={!latestPreview} title="Copy image" onClick={() => void copyLastCapture()}>
                       <Copy size={16} />
                     </button>
@@ -1454,12 +1913,14 @@ const DendroCaptureApp = () => {
                     </div>
                   ) : pending.slice(0, 3).map((item) => (
                     <div className="dc-queue-row" key={item.id}>
-                      {item.previewBase64 ? <img src={dataUrl(item.previewBase64)} alt="" /> : <div className="dc-queue-placeholder"><Aperture size={16} /></div>}
+                      {item.previewBase64
+                        ? <img src={dataUrl(item.previewBase64)} alt="" className="dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)} />
+                        : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}><Aperture size={16} /></div>}
                       <span>
                         <strong>{captureTitle(item)}</strong>
                         <small>{item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
                       </span>
-                      <button type="button" onClick={() => void retryPending(item)} disabled={busy === `retry-${item.id}`}>
+                      <button type="button" onClick={() => void retryPending(item)} disabled={!!busy}>
                         <RefreshCw size={14} />
                       </button>
                     </div>
@@ -1474,11 +1935,17 @@ const DendroCaptureApp = () => {
                 <div className="dc-panel-head">
                   <div>
                     <h2>Local History</h2>
-                    <p>Unpaired captures are saved locally and kept out of Dendro Assets.</p>
+                    <p>Captures taken while unpaired, stored on this device.</p>
                   </div>
-                  <span>{localCaptures.length} saved</span>
+                  <span>{pairedDevice ? 'Paired' : `${localCaptures.length} captures`}</span>
                 </div>
-                {localCaptures.length === 0 ? (
+                {pairedDevice ? (
+                  <div className="dc-empty-drop">
+                    <Cloud size={36} />
+                    <strong>History is off while paired</strong>
+                    <span>Captures upload to Dendro Assets instead. Unpair to keep captures locally.</span>
+                  </div>
+                ) : localCaptures.length === 0 ? (
                   <div className="dc-empty-drop">
                     <ImageIcon size={36} />
                     <strong>No local captures yet</strong>
@@ -1487,11 +1954,27 @@ const DendroCaptureApp = () => {
                 ) : (
                   <div className="dc-history-grid">
                     {localCaptures.map((item) => (
-                      <article className="dc-history-card" key={item.id}>
+                      <article
+                        className={`dc-history-card${item.filePath ? ' dc-clickable' : ''}`}
+                        key={item.id}
+                        title={item.filePath ? 'Show in folder' : undefined}
+                        onClick={() => { if (item.filePath) void revealCapture(item); }}
+                      >
                         {item.previewBase64 ? <img src={dataUrl(item.previewBase64)} alt="" /> : <div><ImageIcon size={24} /></div>}
                         <strong>{captureTitle(item)}</strong>
                         <small>{relativeTime(item.capturedAt)} - {item.width}x{item.height}</small>
                         {item.filePath && <code>{item.filePath}</code>}
+                        <button
+                          type="button"
+                          className="dc-card-action"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void openDrawEditor(item, 'history');
+                          }}
+                        >
+                          <Brush size={13} />
+                          Draw
+                        </button>
                       </article>
                     ))}
                   </div>
@@ -1519,12 +2002,14 @@ const DendroCaptureApp = () => {
                   </div>
                 ) : pending.map((item) => (
                   <div className="dc-queue-row" key={item.id}>
-                    {item.previewBase64 ? <img src={dataUrl(item.previewBase64)} alt="" /> : <div className="dc-queue-placeholder"><Aperture size={16} /></div>}
+                    {item.previewBase64
+                      ? <img src={dataUrl(item.previewBase64)} alt="" className="dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)} />
+                      : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}><Aperture size={16} /></div>}
                     <span>
                       <strong>{captureTitle(item)}</strong>
                       <small>{item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
                     </span>
-                    <button type="button" onClick={() => void retryPending(item)} disabled={busy === `retry-${item.id}`}>
+                    <button type="button" onClick={() => void retryPending(item)} disabled={!!busy}>
                       <RefreshCw size={14} />
                     </button>
                   </div>
@@ -1555,10 +2040,10 @@ const DendroCaptureApp = () => {
                       Pair
                     </button>
                   </div>
-                  {device ? (
+                  {pairedDevice ? (
                     <div className="dc-device">
                       <CheckCircle2 size={16} />
-                      <span>{device.deviceId}</span>
+                      <span>{pairedDevice.deviceId}</span>
                     </div>
                   ) : (
                     <p className="dc-muted">Pairing is optional. Without it, captures stay local and are never uploaded.</p>
@@ -1622,19 +2107,30 @@ const DendroCaptureApp = () => {
                     />
                     Hide DendroCapture during capture
                   </label>
+                  <label className="dc-check">
+                    <input
+                      type="checkbox"
+                      checked={settings.launchOnStartup}
+                      onChange={(e) => updateSettings({ launchOnStartup: e.target.checked })}
+                    />
+                    Launch DendroCapture when the computer starts
+                  </label>
                 </div>
 
-                <div className="dc-panel dc-notes">
-                  <h2>Stored Metadata</h2>
-                  <p><Sparkles size={14} /> Local captures store date, resolution, active app, window title, mode, quality, and platform metadata.</p>
-                  <p><Clipboard size={14} /> The PNG is copied to the system clipboard before upload or local save finishes.</p>
-                  <p><Cloud size={14} /> Paired uploads go to DendroWebsite API, then the VPS uses the existing HMAC Mac worker flow.</p>
-                </div>
               </section>
             )}
           </main>
         </div>
       </div>
+      {editingCapture && (
+        <AnnotationEditor
+          imageBase64={editingCapture.imageBase64}
+          title={editingCapture.title}
+          replaceDefault
+          onClose={() => setEditingCapture(null)}
+          onSave={saveEditedCapture}
+        />
+      )}
     </div>
   );
 };

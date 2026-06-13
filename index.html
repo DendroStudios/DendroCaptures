@@ -4,6 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>DendroCapture</title>
+    <script>
+      if (new URLSearchParams(window.location.search).get('captureOverlay') === 'area') {
+        document.documentElement.classList.add('dc-capture-overlay-page');
+      }
+    </script>
+    <style>
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #05080c;
+        color: #f1f6ff;
+        color-scheme: dark;
+      }
+
+      html.dc-capture-overlay-page,
+      html.dc-capture-overlay-page body,
+      html.dc-capture-overlay-page #root {
+        background: transparent !important;
+        color-scheme: normal;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
