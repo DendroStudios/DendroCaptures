@@ -77,6 +77,7 @@ interface CaptureSettings {
   areaShortcut: string;
   fullscreenShortcut: string;
   qualityScale: number;
+  delayedAreaCaptureSeconds: number;
   deviceName: string;
   openAfterUpload: boolean;
   hideDuringCapture: boolean;
@@ -138,12 +139,18 @@ interface AreaSessionPayload {
   captureId: string;
   session: AreaCaptureSession;
   qualityScale: number;
+  delayedCaptureSeconds: number;
 }
 
 interface CaptureCropRequestPayload {
   captureId: string;
   rect: CaptureRegionRect;
   qualityScale: number;
+  delayedCaptureSeconds: number;
+}
+
+interface CaptureCancelPayload {
+  restoreWindow?: boolean;
 }
 
 const APP_VERSION = '0.1.28';
@@ -165,6 +172,7 @@ const defaultSettings: CaptureSettings = {
   areaShortcut: DEFAULT_AREA_SHORTCUT,
   fullscreenShortcut: 'Alt+Shift+5',
   qualityScale: 1,
+  delayedAreaCaptureSeconds: 2,
   deviceName: 'DendroCapture Desktop',
   openAfterUpload: true,
   hideDuringCapture: true,
@@ -240,11 +248,15 @@ const loadSettings = (): CaptureSettings => {
   const qualityScale = typeof raw.qualityScale === 'number' && Number.isFinite(raw.qualityScale)
     ? clampNumber(raw.qualityScale, 0.25, 1)
     : defaultSettings.qualityScale;
+  const delayedAreaCaptureSeconds = typeof raw.delayedAreaCaptureSeconds === 'number' && Number.isFinite(raw.delayedAreaCaptureSeconds)
+    ? clampNumber(raw.delayedAreaCaptureSeconds, 0, 10)
+    : defaultSettings.delayedAreaCaptureSeconds;
   const settings: CaptureSettings = {
     apiBaseUrl: str(raw.apiBaseUrl, defaultSettings.apiBaseUrl),
     areaShortcut: str(raw.areaShortcut, defaultSettings.areaShortcut),
     fullscreenShortcut: str(raw.fullscreenShortcut, defaultSettings.fullscreenShortcut),
     qualityScale,
+    delayedAreaCaptureSeconds,
     deviceName: str(raw.deviceName, defaultSettings.deviceName),
     openAfterUpload: bool(raw.openAfterUpload, defaultSettings.openAfterUpload),
     hideDuringCapture: bool(raw.hideDuringCapture, defaultSettings.hideDuringCapture),
@@ -461,12 +473,14 @@ const CaptureOverlayApp = () => {
   const [start, setStart] = useState<{ x: number; y: number } | null>(null);
   const [current, setCurrent] = useState<{ x: number; y: number } | null>(null);
   const [pointer, setPointer] = useState<{ x: number; y: number } | null>(null);
+  const [delayedCaptureArmed, setDelayedCaptureArmed] = useState(false);
   const [finishing, setFinishing] = useState(false);
 
   const resetSelection = useCallback(() => {
     setStart(null);
     setCurrent(null);
     setPointer(null);
+    setDelayedCaptureArmed(false);
     setFinishing(false);
   }, []);
 
@@ -505,19 +519,26 @@ const CaptureOverlayApp = () => {
     };
   }, [resetSelection]);
 
-  const cancelOverlay = useCallback(async () => {
+  const cancelOverlay = useCallback(async (restoreWindow = true) => {
     resetSelection();
-    await emitTo('main', 'capture-cancelled', 'area').catch(() => undefined);
+    await emitTo('main', 'capture-cancelled', { restoreWindow } satisfies CaptureCancelPayload).catch(() => undefined);
   }, [resetSelection]);
 
   useEffect(() => {
-    // Fallback only: the overlay is a no-activate window, so the global
-    // Escape shortcut registered by the main window handles cancellation.
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') void cancelOverlay();
+    // Fallback only: the overlay is no-activate, so the global Escape shortcut
+    // below is the reliable cancel path. This still catches Escape if the
+    // webview ever receives focus.
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      void cancelOverlay(false);
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onEscape, true);
+    window.addEventListener('keyup', onEscape, true);
+    return () => {
+      window.removeEventListener('keydown', onEscape, true);
+      window.removeEventListener('keyup', onEscape, true);
+    };
   }, [cancelOverlay]);
 
   const selectionBox = useMemo(() => {
@@ -538,6 +559,9 @@ const CaptureOverlayApp = () => {
     }
 
     setFinishing(true);
+    const delayedCaptureSeconds = delayedCaptureArmed
+      ? clampNumber(payload.delayedCaptureSeconds, 0, 10)
+      : 0;
     const scaleX = payload.session.width / Math.max(1, window.innerWidth);
     const scaleY = payload.session.height / Math.max(1, window.innerHeight);
     const rect: CaptureRegionRect = {
@@ -559,6 +583,7 @@ const CaptureOverlayApp = () => {
         captureId: payload.captureId,
         rect,
         qualityScale: payload.qualityScale,
+        delayedCaptureSeconds,
       } satisfies CaptureCropRequestPayload);
     } catch (error) {
       await emitTo('main', 'capture-error', error instanceof Error ? error.message : 'Area capture failed')
@@ -580,7 +605,10 @@ const CaptureOverlayApp = () => {
       onPointerDown={(event) => {
         if (finishing || !payload) return;
         if (event.button === 2) {
-          void cancelOverlay();
+          event.preventDefault();
+          if (start && current && payload.delayedCaptureSeconds > 0) {
+            setDelayedCaptureArmed(true);
+          }
           return;
         }
         if (event.button !== 0) return;
@@ -595,6 +623,9 @@ const CaptureOverlayApp = () => {
         const point = clampPoint(event);
         setPointer(point);
         if (start) setCurrent(point);
+        if (start && payload.delayedCaptureSeconds > 0 && (event.buttons & 2) === 2) {
+          setDelayedCaptureArmed(true);
+        }
       }}
       onPointerUp={(event) => {
         if (event.button === 0) void finishSelection();
@@ -608,7 +639,7 @@ const CaptureOverlayApp = () => {
         title="press ESC"
         aria-label="Cancel capture selection. Press ESC."
         onPointerDown={(event) => event.stopPropagation()}
-        onClick={() => void cancelOverlay()}
+        onClick={() => void cancelOverlay(true)}
       >
         <X size={16} />
         Cancel
@@ -629,7 +660,10 @@ const CaptureOverlayApp = () => {
             height: selectionBox.height,
           }}
         >
-          <span>{Math.round(selectionBox.width)} x {Math.round(selectionBox.height)}</span>
+          <span>
+            {Math.round(selectionBox.width)} x {Math.round(selectionBox.height)}
+            {delayedCaptureArmed ? ` - ${clampNumber(payload?.delayedCaptureSeconds || 0, 0, 10)}s delay` : ''}
+          </span>
         </div>
       )}
     </div>
@@ -1365,15 +1399,29 @@ const DendroCaptureApp = () => {
     }, 3500);
   }, [clearAreaDeliveryWatchdog, recoverStaleAreaCapture]);
 
-  const cancelAreaCapture = useCallback(async () => {
+  const cancelAreaCapture = useCallback(async (restoreWindow = true) => {
     if (!areaSessionRef.current) return;
     activeCaptureContextRef.current = null;
     await teardownAreaCapture();
-    await restoreMainWindowAfterCancel();
+    if (restoreWindow) await restoreMainWindowAfterCancel();
     busyRef.current = null;
     setBusy(null);
     setStatus('Area capture canceled');
   }, [restoreMainWindowAfterCancel, teardownAreaCapture]);
+
+  useEffect(() => {
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || !areaSessionRef.current) return;
+      event.preventDefault();
+      void cancelAreaCapture(false);
+    };
+    window.addEventListener('keydown', onEscape, true);
+    window.addEventListener('keyup', onEscape, true);
+    return () => {
+      window.removeEventListener('keydown', onEscape, true);
+      window.removeEventListener('keyup', onEscape, true);
+    };
+  }, [cancelAreaCapture]);
 
   const registerEscapeCancel = useCallback(async () => {
     if (escapeRegisteredRef.current) return;
@@ -1382,7 +1430,7 @@ const DendroCaptureApp = () => {
       // The overlay is a no-activate window (it never takes keyboard focus,
       // so the captured app is not disturbed); Escape must be global.
       await register('Escape', (event) => {
-        if (event.state === 'Pressed') void cancelAreaCapture();
+        if (event.state === 'Pressed') void cancelAreaCapture(false);
       });
     } catch {
       escapeRegisteredRef.current = false;
@@ -1477,7 +1525,8 @@ const DendroCaptureApp = () => {
         // screen, then grab the selected region live - Gyazo style.
         await teardownAreaCapture();
         try {
-          await wait(140);
+          const delayMs = Math.round(clampNumber(event.payload.delayedCaptureSeconds, 0, 10) * 1000);
+          await wait(delayMs || 140);
           const capture = await invoke<NativeCapture>('finish_area_capture', {
             rect: event.payload.rect,
             qualityScale: event.payload.qualityScale,
@@ -1494,8 +1543,11 @@ const DendroCaptureApp = () => {
           setStatus(error instanceof Error ? error.message : 'Area capture failed');
         }
       }),
-      listen<string>('capture-cancelled', async () => {
-        await cancelAreaCapture();
+      listen<CaptureCancelPayload | string>('capture-cancelled', async (event) => {
+        const restoreWindow = typeof event.payload === 'object' && event.payload !== null
+          ? event.payload.restoreWindow !== false
+          : true;
+        await cancelAreaCapture(restoreWindow);
       }),
       listen<string>('capture-error', async (event) => {
         activeCaptureContextRef.current = null;
@@ -1533,7 +1585,12 @@ const DendroCaptureApp = () => {
       });
       const { createdNow } = await overlayPromise;
       areaSessionRef.current = { captureId };
-      const payload: AreaSessionPayload = { captureId, session, qualityScale: settingsRef.current.qualityScale };
+      const payload: AreaSessionPayload = {
+        captureId,
+        session,
+        qualityScale: settingsRef.current.qualityScale,
+        delayedCaptureSeconds: clampNumber(settingsRef.current.delayedAreaCaptureSeconds, 0, 10),
+      };
       await registerEscapeCancel();
       if (!createdNow || overlayReadyRef.current) {
         await deliverAreaSession(payload);
@@ -1694,6 +1751,10 @@ const DendroCaptureApp = () => {
   };
 
   const qualityLabel = useMemo(() => `${Math.round(settings.qualityScale * 100)}%`, [settings.qualityScale]);
+  const areaDelayLabel = useMemo(() => {
+    const seconds = clampNumber(settings.delayedAreaCaptureSeconds, 0, 10);
+    return seconds === 0 ? 'Off' : `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s`;
+  }, [settings.delayedAreaCaptureSeconds]);
 
   const navItems: Array<{ id: AppTab; label: string; icon: React.ReactNode; shortcut: string }> = [
     { id: 'capture', label: 'Capture', icon: <Crosshair size={18} />, shortcut: 'Ctrl+1' },
@@ -1793,31 +1854,6 @@ const DendroCaptureApp = () => {
 
             {tab === 'capture' && (
               <section className="dc-capture-dashboard">
-                <div className="dc-action-column">
-                  <button type="button" className="dc-primary-action" onClick={() => void startAreaCapture()} disabled={!!busy}>
-                    <span className="dc-action-icon dc-action-image-icon">
-                      <img src="/capture-area.svg" alt="" />
-                    </span>
-                    <span className="dc-action-copy">
-                      <strong>Capture Area</strong>
-                      <kbd>{settings.areaShortcut}</kbd>
-                    </span>
-                    <ChevronRight size={22} />
-                  </button>
-                  <div className="dc-action-slot">
-                    <button type="button" className="dc-primary-action secondary" onClick={() => void openFullscreenPicker()} disabled={!!busy}>
-                      <span className="dc-action-icon dc-action-image-icon">
-                        <img src="/capture-fullscreen.svg" alt="" />
-                      </span>
-                      <span className="dc-action-copy">
-                        <strong>Capture Fullscreen</strong>
-                        <kbd>{settings.fullscreenShortcut}</kbd>
-                      </span>
-                      <ChevronRight size={22} />
-                    </button>
-                  </div>
-                </div>
-
                 <div className="dc-preview-panel">
                   {fullscreenPicker && (
                     <div className="dc-fullscreen-picker">
@@ -1893,40 +1929,30 @@ const DendroCaptureApp = () => {
                   )}
                 </div>
 
-                <section className="dc-panel dc-queue-card">
-                  <div className="dc-panel-head">
-                    <div>
-                      <h2>Queue</h2>
-                      <p>Failed uploads are kept here until you retry them.</p>
-                    </div>
-                    <span>{pending.length} pending</span>
-                    <button type="button" className="dc-btn" disabled={!pending.length || !!busy} onClick={() => void retryAllPending()}>
-                      <RefreshCw size={14} />
-                      Retry All
+                <div className="dc-action-column">
+                  <button type="button" className="dc-primary-action" onClick={() => void startAreaCapture()} disabled={!!busy}>
+                    <span className="dc-action-icon dc-action-image-icon">
+                      <img src="/capture-area.svg" alt="" />
+                    </span>
+                    <span className="dc-action-copy">
+                      <strong>Capture Area</strong>
+                      <kbd>{settings.areaShortcut}</kbd>
+                    </span>
+                    <ChevronRight size={22} />
+                  </button>
+                  <div className="dc-action-slot">
+                    <button type="button" className="dc-primary-action secondary" onClick={() => void openFullscreenPicker()} disabled={!!busy}>
+                      <span className="dc-action-icon dc-action-image-icon">
+                        <img src="/capture-fullscreen.svg" alt="" />
+                      </span>
+                      <span className="dc-action-copy">
+                        <strong>Capture Fullscreen</strong>
+                        <kbd>{settings.fullscreenShortcut}</kbd>
+                      </span>
+                      <ChevronRight size={22} />
                     </button>
                   </div>
-                  {pending.length === 0 ? (
-                    <div className="dc-empty-drop">
-                      <UploadCloud size={36} />
-                      <strong>No pending uploads</strong>
-                      <span>Captures will appear here if an upload fails.</span>
-                    </div>
-                  ) : pending.slice(0, 3).map((item) => (
-                    <div className="dc-queue-row" key={item.id}>
-                      {item.previewBase64
-                        ? <img src={dataUrl(item.previewBase64)} alt="" className="dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)} />
-                        : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}><Aperture size={16} /></div>}
-                      <span>
-                        <strong>{captureTitle(item)}</strong>
-                        <small>{item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
-                      </span>
-                      <button type="button" onClick={() => void retryPending(item)} disabled={!!busy}>
-                        <RefreshCw size={14} />
-                      </button>
-                    </div>
-                  ))}
-                </section>
-
+                </div>
               </section>
             )}
 
@@ -2089,6 +2115,17 @@ const DendroCaptureApp = () => {
                       step="0.05"
                       value={settings.qualityScale}
                       onChange={(e) => updateSettings({ qualityScale: Number(e.target.value) })}
+                    />
+                  </label>
+                  <label>
+                    Area right-click delay <b>{areaDelayLabel}</b>
+                    <input
+                      type="range"
+                      min="0"
+                      max="10"
+                      step="0.5"
+                      value={settings.delayedAreaCaptureSeconds}
+                      onChange={(e) => updateSettings({ delayedAreaCaptureSeconds: clampNumber(Number(e.target.value), 0, 10) })}
                     />
                   </label>
                   <label className="dc-check">

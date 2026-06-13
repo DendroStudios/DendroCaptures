@@ -527,18 +527,15 @@ kbd {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(228px, 0.58fr) minmax(0, 1.42fr);
-  /* min-content keeps the action buttons from overflowing onto the queue row;
-     the preview panel opts out via min-height: 0 so images can't blow up the track. */
-  grid-template-rows: minmax(min-content, 1fr) minmax(148px, auto);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 12px;
 }
 
 .dc-action-column {
   display: grid;
-  grid-template-rows: auto auto;
-  align-content: start;
-  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .dc-action-slot {
@@ -548,7 +545,7 @@ kbd {
 
 .dc-primary-action {
   position: relative;
-  min-height: 104px;
+  min-height: 86px;
   display: grid;
   grid-template-columns: 62px minmax(0, 1fr) auto;
   align-items: center;
@@ -625,7 +622,7 @@ kbd {
 
 .dc-action-copy strong {
   font-family: var(--font-condensed);
-  font-size: clamp(21px, 2.8vw, 24px);
+  font-size: clamp(19px, 2.2vw, 23px);
   font-weight: 900;
   line-height: 1.08;
 }
@@ -1598,7 +1595,6 @@ kbd {
   }
 
   .dc-capture-dashboard {
-    grid-template-columns: minmax(218px, 0.55fr) minmax(0, 1.45fr);
     gap: 11px;
   }
 
@@ -1622,7 +1618,7 @@ kbd {
   }
 
   .dc-primary-action {
-    min-height: 98px;
+    min-height: 84px;
     grid-template-columns: 56px minmax(0, 1fr) auto;
     padding: 12px;
   }
@@ -1739,12 +1735,11 @@ kbd {
   }
 
   .dc-capture-dashboard {
-    grid-template-rows: auto minmax(220px, 1fr);
+    grid-template-rows: minmax(220px, 1fr) auto;
   }
 
-  /* Tight on space: the Queue tab still has the full list. */
-  .dc-queue-card {
-    display: none;
+  .dc-action-column {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -1779,7 +1774,7 @@ kbd {
   }
 
   .dc-primary-action {
-    min-height: 96px;
+    min-height: 78px;
     grid-template-columns: 58px minmax(0, 1fr) auto;
     padding: 12px;
   }
@@ -1821,12 +1816,12 @@ kbd {
 /* Short windows (small screens / heavy display zoom): drop the pending-uploads
    panel from the Capture tab — the Queue tab still has everything. */
 @media (max-height: 600px) and (min-width: 701px) {
-  .dc-queue-card {
-    display: none;
+  .dc-capture-dashboard {
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 
-  .dc-capture-dashboard {
-    grid-template-rows: minmax(min-content, 1fr);
+  .dc-primary-action {
+    min-height: 72px;
   }
 }
 
