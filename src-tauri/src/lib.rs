@@ -42,7 +42,7 @@ pub struct CaptureMonitor {
     is_primary: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AreaCaptureSession {
     width: u32,
@@ -50,6 +50,7 @@ pub struct AreaCaptureSession {
     scale_factor: f64,
     origin_x: i32,
     origin_y: i32,
+    png_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -474,15 +475,24 @@ async fn capture_display(monitor_id: u32, quality_scale: f64) -> Result<CaptureR
 async fn begin_area_capture(
     cursor_x: Option<i32>,
     cursor_y: Option<i32>,
+    include_snapshot: Option<bool>,
 ) -> Result<AreaCaptureSession, String> {
     let screen = screen_for_point(cursor_x, cursor_y)?;
     let info = screen.display_info;
+    let (width, height, png_base64) = if include_snapshot.unwrap_or(true) {
+        let image = screen.capture().map_err(err)?;
+        let (png, width, height) = encode_png(image, 1.0)?;
+        (width, height, Some(BASE64.encode(png)))
+    } else {
+        (info.width, info.height, None)
+    };
     Ok(AreaCaptureSession {
-        width: info.width,
-        height: info.height,
+        width,
+        height,
         scale_factor: f64::from(info.scale_factor),
         origin_x: info.x,
         origin_y: info.y,
+        png_base64,
     })
 }
 
@@ -522,13 +532,657 @@ async fn finish_area_capture(rect: CaptureRegionRect, quality_scale: f64) -> Res
     })
 }
 
-/// Makes the capture overlay non-occluding for Chromium-based apps so a
-/// browser underneath keeps rendering video instead of freezing as "hidden".
-/// Chromium's native window occlusion tracker skips a window when it is a
-/// layered window with alpha below 255 OR when it has a complex (non
-/// rectangular) window region; both are applied here because either can be
-/// reset by the windowing stack. Visually the overlay stays indistinguishable
-/// from opaque: alpha is 254/255 and the region only drops one corner pixel.
+#[tauri::command]
+async fn finish_area_capture_from_snapshot(
+    session: AreaCaptureSession,
+    rect: CaptureRegionRect,
+    quality_scale: f64,
+) -> Result<CaptureResult, String> {
+    let png_base64 = session
+        .png_base64
+        .ok_or_else(|| "Area capture snapshot is missing".to_string())?;
+    let bytes = BASE64.decode(png_base64).map_err(err)?;
+    let image = image::load_from_memory(&bytes).map_err(err)?.to_rgba8();
+    let scale_x = image.width() as f64 / f64::from(session.width.max(1));
+    let scale_y = image.height() as f64 / f64::from(session.height.max(1));
+    let x = (((rect.x - session.origin_x) as f64) * scale_x)
+        .round()
+        .clamp(0.0, image.width().saturating_sub(1) as f64) as u32;
+    let y = (((rect.y - session.origin_y) as f64) * scale_y)
+        .round()
+        .clamp(0.0, image.height().saturating_sub(1) as f64) as u32;
+    let width = ((f64::from(rect.width.max(1)) * scale_x).round().max(1.0) as u32)
+        .min(image.width() - x)
+        .max(1);
+    let height = ((f64::from(rect.height.max(1)) * scale_y).round().max(1.0) as u32)
+        .min(image.height() - y)
+        .max(1);
+    let cropped = imageops::crop_imm(&image, x, y, width, height).to_image();
+    let (png, out_width, out_height) = encode_png(cropped, quality_scale)?;
+    Ok(CaptureResult {
+        png_base64: BASE64.encode(png),
+        width: out_width,
+        height: out_height,
+        display_width: width,
+        display_height: height,
+        scale_factor: session.scale_factor,
+        origin_x: rect.x,
+        origin_y: rect.y,
+        monitors: empty_capture_monitors(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct NativeSelectionState {
+    start_x: i32,
+    start_y: i32,
+    current_x: i32,
+    current_y: i32,
+    drawn_left: i32,
+    drawn_top: i32,
+    drawn_right: i32,
+    drawn_bottom: i32,
+    has_drawn: bool,
+    dragging: bool,
+    done: bool,
+    cancelled: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct NativeSelectionHookContext {
+    origin_x: i32,
+    origin_y: i32,
+    width: i32,
+    height: i32,
+    state: *mut NativeSelectionState,
+}
+
+#[cfg(target_os = "windows")]
+static mut NATIVE_SELECTION_HOOK_CONTEXT: *mut NativeSelectionHookContext = std::ptr::null_mut();
+
+#[cfg(target_os = "windows")]
+fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+    use std::{ffi::c_void, mem::zeroed, ptr::null_mut};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, ReleaseCapture, SetCapture, VK_ESCAPE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetWindowLongPtrW,
+        LoadCursorW, PeekMessageW, RegisterClassW, SetCursor,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
+        IDC_CROSS, LWA_ALPHA, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+
+    const INPUT_CLASS: &[u16] = &[
+        b'D' as u16, b'e' as u16, b'n' as u16, b'd' as u16, b'r' as u16, b'o' as u16,
+        b'C' as u16, b'a' as u16, b'p' as u16, b't' as u16, b'u' as u16, b'r' as u16,
+        b'e' as u16, b'I' as u16, b'n' as u16, b'p' as u16, b'u' as u16, b't' as u16,
+        0,
+    ];
+    const BORDER_CLASS: &[u16] = &[
+        b'D' as u16, b'e' as u16, b'n' as u16, b'd' as u16, b'r' as u16, b'o' as u16,
+        b'C' as u16, b'a' as u16, b'p' as u16, b't' as u16, b'u' as u16, b'r' as u16,
+        b'e' as u16, b'B' as u16, b'o' as u16, b'r' as u16, b'd' as u16, b'e' as u16,
+        b'r' as u16, 0,
+    ];
+    const BORDER_COLOR: u32 = 0x00ffbd84;
+    const BORDER_THICKNESS: i32 = 2;
+
+    #[derive(Default)]
+    struct AlphaSelectionState {
+        origin_x: i32,
+        origin_y: i32,
+        capture_width: u32,
+        capture_height: u32,
+        client_width: i32,
+        client_height: i32,
+        start_x: i32,
+        start_y: i32,
+        current_x: i32,
+        current_y: i32,
+        dragging: bool,
+        done: bool,
+        cancelled: bool,
+        borders: [HWND; 4],
+    }
+
+    fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
+        let x = (lparam as u32 & 0xffff) as i16 as i32;
+        let y = ((lparam as u32 >> 16) & 0xffff) as i16 as i32;
+        (x, y)
+    }
+
+    unsafe fn hide_borders(state: &AlphaSelectionState) {
+        for hwnd in state.borders {
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    unsafe fn update_borders(state: &AlphaSelectionState) {
+        let left = state.start_x.min(state.current_x) + state.origin_x;
+        let top = state.start_y.min(state.current_y) + state.origin_y;
+        let right = state.start_x.max(state.current_x) + state.origin_x;
+        let bottom = state.start_y.max(state.current_y) + state.origin_y;
+        let width = (right - left).max(1);
+        let height = (bottom - top).max(1);
+        let t = BORDER_THICKNESS;
+        let rects = [
+            (left, top, width, t),
+            (left, bottom.saturating_sub(t), width, t),
+            (left, top, t, height),
+            (right.saturating_sub(t), top, t, height),
+        ];
+
+        for (hwnd, (x, y, w, h)) in state.borders.into_iter().zip(rects) {
+            if hwnd.is_null() {
+                continue;
+            }
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    fn selected_capture_rect(state: &AlphaSelectionState) -> CaptureRegionRect {
+        let client_width = state.client_width.max(1);
+        let client_height = state.client_height.max(1);
+        let left = state.start_x.min(state.current_x).clamp(0, client_width);
+        let top = state.start_y.min(state.current_y).clamp(0, client_height);
+        let right = state.start_x.max(state.current_x).clamp(0, client_width);
+        let bottom = state.start_y.max(state.current_y).clamp(0, client_height);
+        let scale_x = state.capture_width as f64 / f64::from(client_width);
+        let scale_y = state.capture_height as f64 / f64::from(client_height);
+        let x = state.origin_x + (f64::from(left) * scale_x).round() as i32;
+        let y = state.origin_y + (f64::from(top) * scale_y).round() as i32;
+        let width = (f64::from((right - left).max(1)) * scale_x).round().max(1.0) as u32;
+        let height = (f64::from((bottom - top).max(1)) * scale_y).round().max(1.0) as u32;
+        let max_width = state.capture_width.saturating_sub((x - state.origin_x).max(0) as u32).max(1);
+        let max_height = state.capture_height.saturating_sub((y - state.origin_y).max(0) as u32).max(1);
+        CaptureRegionRect {
+            x,
+            y,
+            width: width.min(max_width),
+            height: height.min(max_height),
+        }
+    }
+
+    unsafe extern "system" fn input_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AlphaSelectionState;
+        match msg {
+            WM_CREATE => {
+                let create = lparam as *const CREATESTRUCTW;
+                if !create.is_null() {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
+                }
+                0
+            }
+            WM_SETCURSOR => {
+                SetCursor(LoadCursorW(null_mut(), IDC_CROSS));
+                1
+            }
+            WM_LBUTTONDOWN => {
+                if !state_ptr.is_null() {
+                    let (x, y) = point_from_lparam(lparam);
+                    let state = &mut *state_ptr;
+                    state.start_x = x;
+                    state.start_y = y;
+                    state.current_x = x;
+                    state.current_y = y;
+                    state.dragging = true;
+                    SetCapture(hwnd);
+                    update_borders(state);
+                }
+                0
+            }
+            WM_MOUSEMOVE => {
+                if !state_ptr.is_null() {
+                    let (x, y) = point_from_lparam(lparam);
+                    let state = &mut *state_ptr;
+                    state.current_x = x;
+                    state.current_y = y;
+                    if state.dragging {
+                        update_borders(state);
+                    }
+                }
+                0
+            }
+            WM_LBUTTONUP => {
+                if !state_ptr.is_null() {
+                    let (x, y) = point_from_lparam(lparam);
+                    let state = &mut *state_ptr;
+                    state.current_x = x;
+                    state.current_y = y;
+                    state.dragging = false;
+                    ReleaseCapture();
+                    hide_borders(state);
+                    let width = (state.current_x - state.start_x).abs();
+                    let height = (state.current_y - state.start_y).abs();
+                    if width < 8 || height < 8 {
+                        state.cancelled = true;
+                    } else {
+                        state.done = true;
+                    }
+                }
+                0
+            }
+            WM_RBUTTONDOWN => {
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+                    state.cancelled = true;
+                    ReleaseCapture();
+                    hide_borders(state);
+                }
+                0
+            }
+            WM_DESTROY => 0,
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe extern "system" fn border_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    let screen = screen_for_point(cursor_x, cursor_y)?;
+    let info = screen.display_info;
+    let mut state = Box::new(AlphaSelectionState {
+        origin_x: info.x,
+        origin_y: info.y,
+        capture_width: info.width,
+        capture_height: info.height,
+        client_width: info.width as i32,
+        client_height: info.height as i32,
+        ..Default::default()
+    });
+
+    unsafe {
+        let input_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(input_wnd_proc),
+            hInstance: null_mut(),
+            lpszClassName: INPUT_CLASS.as_ptr(),
+            hCursor: LoadCursorW(null_mut(), IDC_CROSS),
+            ..zeroed()
+        };
+        RegisterClassW(&input_class);
+
+        let border_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(border_wnd_proc),
+            hInstance: null_mut(),
+            lpszClassName: BORDER_CLASS.as_ptr(),
+            hbrBackground: CreateSolidBrush(BORDER_COLOR),
+            ..zeroed()
+        };
+        RegisterClassW(&border_class);
+
+        for index in 0..state.borders.len() {
+            state.borders[index] = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                BORDER_CLASS.as_ptr(),
+                BORDER_CLASS.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+        }
+
+        let input_hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            INPUT_CLASS.as_ptr(),
+            INPUT_CLASS.as_ptr(),
+            WS_POPUP,
+            info.x,
+            info.y,
+            info.width as i32,
+            info.height as i32,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            state.as_mut() as *mut AlphaSelectionState as *const c_void,
+        );
+        if input_hwnd.is_null() {
+            for border in state.borders {
+                if !border.is_null() {
+                    DestroyWindow(border);
+                }
+            }
+            return Err("Could not open native capture selector".to_string());
+        }
+
+        SetLayeredWindowAttributes(input_hwnd, 0, 1, LWA_ALPHA);
+        ShowWindow(input_hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(input_hwnd);
+        let mut client_rect: RECT = zeroed();
+        if GetClientRect(input_hwnd, &mut client_rect) != 0 {
+            state.client_width = (client_rect.right - client_rect.left).max(1);
+            state.client_height = (client_rect.bottom - client_rect.top).max(1);
+        }
+
+        let mut msg: MSG = zeroed();
+        while !state.done && !state.cancelled {
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if GetAsyncKeyState(VK_ESCAPE.into()) < 0 {
+                state.cancelled = true;
+                hide_borders(&state);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+
+        DestroyWindow(input_hwnd);
+        for border in state.borders {
+            if !border.is_null() {
+                DestroyWindow(border);
+            }
+        }
+    }
+
+    if state.cancelled {
+        return Err("Area capture canceled".to_string());
+    }
+
+    Ok(selected_capture_rect(&state))
+}
+
+#[cfg(target_os = "windows")]
+fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+    use std::{mem::zeroed, ptr::null_mut, time::Duration};
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreatePen, DeleteObject, GetDC, GetStockObject, Rectangle, ReleaseDC, SelectObject,
+        SetROP2, HOLLOW_BRUSH, PS_SOLID, R2_NOTXORPEN,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_ESCAPE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetCursorPos, HHOOK, MSLLHOOKSTRUCT, PeekMessageW,
+        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_MOUSE_LL,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
+    };
+    const XOR_LINE_COLOR: u32 = 0x00ffffff;
+
+    unsafe fn draw_focus_rect(state: &mut NativeSelectionState, left: i32, top: i32, right: i32, bottom: i32) {
+        if right <= left || bottom <= top {
+            return;
+        }
+        let hdc = GetDC(null_mut());
+        if hdc.is_null() {
+            return;
+        }
+        let old_rop = SetROP2(hdc, R2_NOTXORPEN);
+        let pen = CreatePen(PS_SOLID, 2, XOR_LINE_COLOR);
+        let old_pen = SelectObject(hdc, pen as _);
+        let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(hdc, left, top, right, bottom);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as _);
+        SetROP2(hdc, old_rop);
+        ReleaseDC(null_mut(), hdc);
+        state.drawn_left = left;
+        state.drawn_top = top;
+        state.drawn_right = right;
+        state.drawn_bottom = bottom;
+        state.has_drawn = true;
+    }
+
+    unsafe fn erase_focus_rect(state: &mut NativeSelectionState) {
+        if !state.has_drawn {
+            return;
+        }
+        let hdc = GetDC(null_mut());
+        if hdc.is_null() {
+            return;
+        }
+        let old_rop = SetROP2(hdc, R2_NOTXORPEN);
+        let pen = CreatePen(PS_SOLID, 2, XOR_LINE_COLOR);
+        let old_pen = SelectObject(hdc, pen as _);
+        let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+        Rectangle(hdc, state.drawn_left, state.drawn_top, state.drawn_right, state.drawn_bottom);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as _);
+        SetROP2(hdc, old_rop);
+        ReleaseDC(null_mut(), hdc);
+        state.has_drawn = false;
+    }
+
+    unsafe fn redraw_selection(state: &mut NativeSelectionState, context: &NativeSelectionHookContext) {
+        erase_focus_rect(state);
+        if !state.dragging {
+            return;
+        }
+        let left = state.start_x.min(state.current_x) + context.origin_x;
+        let top = state.start_y.min(state.current_y) + context.origin_y;
+        let right = state.start_x.max(state.current_x) + context.origin_x;
+        let bottom = state.start_y.max(state.current_y) + context.origin_y;
+        draw_focus_rect(state, left, top, right, bottom);
+    }
+
+    unsafe fn update_cursor_selection(state: &mut NativeSelectionState, context: &NativeSelectionHookContext) {
+        if !state.dragging {
+            return;
+        }
+        let mut point: POINT = zeroed();
+        if GetCursorPos(&mut point) == 0 {
+            return;
+        }
+        let x = (point.x - context.origin_x).clamp(0, context.width.max(1));
+        let y = (point.y - context.origin_y).clamp(0, context.height.max(1));
+        if x == state.current_x && y == state.current_y {
+            return;
+        }
+        state.current_x = x;
+        state.current_y = y;
+        redraw_selection(state, context);
+    }
+
+    unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code < 0 {
+            return CallNextHookEx(null_mut(), code, wparam, lparam);
+        }
+
+        let context = NATIVE_SELECTION_HOOK_CONTEXT;
+        if context.is_null() {
+            return CallNextHookEx(null_mut(), code, wparam, lparam);
+        }
+        let context = &mut *context;
+        let state = &mut *context.state;
+        let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
+        let x = (mouse.pt.x - context.origin_x).clamp(0, context.width.max(1));
+        let y = (mouse.pt.y - context.origin_y).clamp(0, context.height.max(1));
+
+        match wparam as u32 {
+            WM_LBUTTONDOWN => {
+                state.start_x = x;
+                state.start_y = y;
+                state.current_x = x;
+                state.current_y = y;
+                state.dragging = true;
+                1
+            }
+            WM_LBUTTONUP => {
+                state.current_x = x;
+                state.current_y = y;
+                state.dragging = false;
+                let width = (state.current_x - state.start_x).abs();
+                let height = (state.current_y - state.start_y).abs();
+                if width < 8 || height < 8 {
+                    state.cancelled = true;
+                } else {
+                    state.done = true;
+                }
+                erase_focus_rect(state);
+                1
+            }
+            WM_RBUTTONDOWN => {
+                erase_focus_rect(state);
+                state.cancelled = true;
+                1
+            }
+            _ => CallNextHookEx(null_mut(), code, wparam, lparam),
+        }
+    }
+
+    let screen = screen_for_point(cursor_x, cursor_y)?;
+    let info = screen.display_info;
+    let mut state = Box::new(NativeSelectionState::default());
+    let state_ptr = state.as_mut() as *mut NativeSelectionState;
+
+    unsafe {
+        let mut hook_context = NativeSelectionHookContext {
+            origin_x: info.x,
+            origin_y: info.y,
+            width: info.width as i32,
+            height: info.height as i32,
+            state: state_ptr,
+        };
+        NATIVE_SELECTION_HOOK_CONTEXT = &mut hook_context;
+        let module = GetModuleHandleW(null_mut());
+        let hook: HHOOK = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), module, 0);
+        if hook.is_null() {
+            NATIVE_SELECTION_HOOK_CONTEXT = null_mut();
+            return Err("Could not install native capture mouse hook".to_string());
+        }
+
+        let mut msg: MSG = zeroed();
+        while !state.done && !state.cancelled {
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            update_cursor_selection(&mut state, &hook_context);
+            if GetAsyncKeyState(VK_ESCAPE.into()) < 0 {
+                state.cancelled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+
+        erase_focus_rect(&mut state);
+        UnhookWindowsHookEx(hook);
+        NATIVE_SELECTION_HOOK_CONTEXT = null_mut();
+    }
+
+    if state.cancelled {
+        return Err("Area capture canceled".to_string());
+    }
+
+    let left = state.start_x.min(state.current_x) + info.x;
+    let top = state.start_y.min(state.current_y) + info.y;
+    Ok(CaptureRegionRect {
+        x: left,
+        y: top,
+        width: (state.current_x - state.start_x).unsigned_abs(),
+        height: (state.current_y - state.start_y).unsigned_abs(),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_select_region(_cursor_x: Option<i32>, _cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+    Err("Native live area selection is only available on Windows".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn snipping_tool_area_capture(quality_scale: f64) -> Result<CaptureResult, String> {
+    use std::{process::Command, thread, time::{Duration, Instant}};
+    use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+
+    let before = unsafe { GetClipboardSequenceNumber() };
+    let status = Command::new("snippingtool")
+        .arg("/clip")
+        .status()
+        .map_err(|error| format!("Could not start Windows Snipping Tool: {error}"))?;
+
+    if !status.success() {
+        return Err("Area capture canceled".to_string());
+    }
+
+    let started = Instant::now();
+    let mut clipboard = Clipboard::new().map_err(err)?;
+    loop {
+        let changed = unsafe { GetClipboardSequenceNumber() } != before;
+        if changed {
+            if let Ok(image) = clipboard.get_image() {
+                let width = image.width as u32;
+                let height = image.height as u32;
+                let rgba = RgbaImage::from_raw(width, height, image.bytes.into_owned())
+                    .ok_or_else(|| "Snipping Tool returned an invalid image".to_string())?;
+                let (png, out_width, out_height) = encode_png(rgba, quality_scale)?;
+                return Ok(CaptureResult {
+                    png_base64: BASE64.encode(png),
+                    width: out_width,
+                    height: out_height,
+                    display_width: width,
+                    display_height: height,
+                    scale_factor: 1.0,
+                    origin_x: 0,
+                    origin_y: 0,
+                    monitors: empty_capture_monitors(),
+                });
+            }
+        }
+
+        if started.elapsed() > Duration::from_secs(5) {
+            return Err("Snipping Tool did not place an image on the clipboard".to_string());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn snipping_tool_area_capture(_quality_scale: f64) -> Result<CaptureResult, String> {
+    Err("Windows Snipping Tool capture is only available on Windows".to_string())
+}
+
+#[tauri::command]
+async fn native_area_capture(
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
+    quality_scale: f64,
+) -> Result<CaptureResult, String> {
+    match native_select_region_alpha_window(cursor_x, cursor_y) {
+        Ok(rect) => finish_area_capture(rect, quality_scale).await,
+        Err(error) if error == "Area capture canceled" => Err(error),
+        Err(_) => match native_select_region(cursor_x, cursor_y) {
+            Ok(rect) => finish_area_capture(rect, quality_scale).await,
+            Err(error) if error == "Area capture canceled" => Err(error),
+            Err(_) => snipping_tool_area_capture(quality_scale),
+        }
+    }
+}
+
+/// Keeps the capture overlay predictable across Windows compositors. The
+/// layered style and tiny complex region avoid several Chromium/window-manager
+/// occlusion edge cases, and are harmless now that normal area capture crops a
+/// frame grabbed before the overlay was shown.
 #[tauri::command]
 fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
     let window = app
@@ -544,7 +1198,7 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
             GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
             GWL_EXSTYLE, GWL_STYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
             SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED,
-            WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
         };
 
         let hwnd = window.hwnd().map_err(err)?.0 as windows_sys::Win32::Foundation::HWND;
@@ -568,7 +1222,7 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
             SetWindowLongPtrW(
                 hwnd,
                 GWL_EXSTYLE,
-                (ex_style | WS_EX_LAYERED as isize | WS_EX_TOOLWINDOW as isize)
+                (ex_style | WS_EX_LAYERED as isize | WS_EX_TOOLWINDOW as isize | WS_EX_NOACTIVATE as isize)
                     & !(WS_EX_APPWINDOW as isize),
             );
             SetWindowPos(
@@ -875,6 +1529,8 @@ pub fn run() {
             capture_display,
             begin_area_capture,
             finish_area_capture,
+            finish_area_capture_from_snapshot,
+            native_area_capture,
             prepare_overlay_window,
             copy_png_to_clipboard,
             platform_label,

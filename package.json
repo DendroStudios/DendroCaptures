@@ -1,6 +1,6 @@
 {
   "name": "dendro-capture",
-  "version": "0.1.28",
+  "version": "0.1.45",
   "private": true,
   "type": "module",
   "scripts": {
