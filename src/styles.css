@@ -1063,6 +1063,36 @@ kbd {
   gap: 10px;
 }
 
+.dc-api-toggle {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 1px solid rgba(151, 184, 224, 0.18);
+  border-radius: 8px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.045);
+  font-weight: 800;
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease, color 160ms ease;
+}
+
+.dc-api-toggle.on {
+  color: var(--green);
+  border-color: rgba(82, 232, 139, 0.34);
+  background: rgba(82, 232, 139, 0.10);
+}
+
+.dc-api-toggle.off {
+  color: var(--danger);
+  border-color: rgba(255, 80, 80, 0.34);
+  background: rgba(255, 80, 80, 0.10);
+}
+
+.dc-api-toggle:hover {
+  box-shadow: 0 0 0 3px rgba(91, 156, 255, 0.08);
+}
+
 .dc-device {
   min-width: 0;
   display: flex;
@@ -1080,6 +1110,21 @@ kbd {
 .dc-check {
   grid-template-columns: auto 1fr !important;
   align-items: center;
+}
+
+.dc-check-with-hint {
+  align-items: start;
+}
+
+.dc-check-with-hint span {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.dc-check-with-hint small {
+  color: var(--muted);
+  line-height: 1.35;
 }
 
 .dc-check input {

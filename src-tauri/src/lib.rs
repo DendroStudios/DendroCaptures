@@ -97,6 +97,11 @@ pub struct CaptureRegionRect {
     height: u32,
 }
 
+struct NativeSelectionResult {
+    rect: CaptureRegionRect,
+    delayed: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VirtualDesktopBounds {
     origin_x: i32,
@@ -587,6 +592,7 @@ struct NativeSelectionState {
     dragging: bool,
     done: bool,
     cancelled: bool,
+    delayed: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -602,7 +608,7 @@ struct NativeSelectionHookContext {
 static mut NATIVE_SELECTION_HOOK_CONTEXT: *mut NativeSelectionHookContext = std::ptr::null_mut();
 
 #[cfg(target_os = "windows")]
-fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
     use std::{ffi::c_void, mem::zeroed, ptr::null_mut};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow};
@@ -650,6 +656,7 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         dragging: bool,
         done: bool,
         cancelled: bool,
+        delayed: bool,
         borders: [HWND; 4],
     }
 
@@ -783,9 +790,13 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
             WM_RBUTTONDOWN => {
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
-                    state.cancelled = true;
-                    ReleaseCapture();
-                    hide_borders(state);
+                    if state.dragging {
+                        state.delayed = true;
+                    } else {
+                        state.cancelled = true;
+                        ReleaseCapture();
+                        hide_borders(state);
+                    }
                 }
                 0
             }
@@ -906,11 +917,14 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         return Err("Area capture canceled".to_string());
     }
 
-    Ok(selected_capture_rect(&state))
+    Ok(NativeSelectionResult {
+        rect: selected_capture_rect(&state),
+        delayed: state.delayed,
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
     use std::{mem::zeroed, ptr::null_mut, time::Duration};
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
@@ -1043,8 +1057,12 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
                 1
             }
             WM_RBUTTONDOWN => {
-                erase_focus_rect(state);
-                state.cancelled = true;
+                if state.dragging {
+                    state.delayed = true;
+                } else {
+                    erase_focus_rect(state);
+                    state.cancelled = true;
+                }
                 1
             }
             _ => CallNextHookEx(null_mut(), code, wparam, lparam),
@@ -1097,16 +1115,19 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
 
     let left = state.start_x.min(state.current_x) + info.x;
     let top = state.start_y.min(state.current_y) + info.y;
-    Ok(CaptureRegionRect {
-        x: left,
-        y: top,
-        width: (state.current_x - state.start_x).unsigned_abs(),
-        height: (state.current_y - state.start_y).unsigned_abs(),
+    Ok(NativeSelectionResult {
+        rect: CaptureRegionRect {
+            x: left,
+            y: top,
+            width: (state.current_x - state.start_x).unsigned_abs(),
+            height: (state.current_y - state.start_y).unsigned_abs(),
+        },
+        delayed: state.delayed,
     })
 }
 
 #[cfg(not(target_os = "windows"))]
-fn native_select_region(_cursor_x: Option<i32>, _cursor_y: Option<i32>) -> Result<CaptureRegionRect, String> {
+fn native_select_region(_cursor_x: Option<i32>, _cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
     Err("Native live area selection is only available on Windows".to_string())
 }
 
@@ -1167,12 +1188,29 @@ async fn native_area_capture(
     cursor_x: Option<i32>,
     cursor_y: Option<i32>,
     quality_scale: f64,
+    delayed_capture_seconds: f64,
 ) -> Result<CaptureResult, String> {
+    async fn finish_selection(
+        selection: NativeSelectionResult,
+        quality_scale: f64,
+        delayed_capture_seconds: f64,
+    ) -> Result<CaptureResult, String> {
+        let delay = if delayed_capture_seconds.is_finite() {
+            delayed_capture_seconds.clamp(0.0, 10.0)
+        } else {
+            0.0
+        };
+        if selection.delayed && delay > 0.0 {
+            std::thread::sleep(std::time::Duration::from_millis((delay * 1000.0).round() as u64));
+        }
+        finish_area_capture(selection.rect, quality_scale).await
+    }
+
     match native_select_region_alpha_window(cursor_x, cursor_y) {
-        Ok(rect) => finish_area_capture(rect, quality_scale).await,
+        Ok(selection) => finish_selection(selection, quality_scale, delayed_capture_seconds).await,
         Err(error) if error == "Area capture canceled" => Err(error),
         Err(_) => match native_select_region(cursor_x, cursor_y) {
-            Ok(rect) => finish_area_capture(rect, quality_scale).await,
+            Ok(selection) => finish_selection(selection, quality_scale, delayed_capture_seconds).await,
             Err(error) if error == "Area capture canceled" => Err(error),
             Err(_) => snipping_tool_area_capture(quality_scale),
         }

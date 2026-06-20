@@ -1,6 +1,6 @@
 [package]
 name = "dendro_capture"
-version = "0.1.45"
+version = "0.1.46"
 description = "DendroCapture desktop screenshot client"
 authors = ["Dendro Studios"]
 edition = "2021"

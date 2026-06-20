@@ -79,9 +79,11 @@ interface CaptureSettings {
   qualityScale: number;
   delayedAreaCaptureSeconds: number;
   deviceName: string;
+  apiSendingEnabled: boolean;
   openAfterUpload: boolean;
   hideDuringCapture: boolean;
   liveAreaSelection: boolean;
+  saveLocally: boolean;
   launchOnStartup: boolean;
 }
 
@@ -158,7 +160,7 @@ interface CaptureCancelPayload {
   restoreWindow?: boolean;
 }
 
-const APP_VERSION = '0.1.45';
+const APP_VERSION = '0.1.46';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
@@ -180,9 +182,11 @@ const defaultSettings: CaptureSettings = {
   qualityScale: 1,
   delayedAreaCaptureSeconds: 2,
   deviceName: 'DendroCapture Desktop',
+  apiSendingEnabled: true,
   openAfterUpload: true,
   hideDuringCapture: true,
   liveAreaSelection: true,
+  saveLocally: true,
   launchOnStartup: true,
 };
 
@@ -270,9 +274,11 @@ const loadSettings = (): CaptureSettings => {
     qualityScale,
     delayedAreaCaptureSeconds,
     deviceName: str(raw.deviceName, defaultSettings.deviceName),
+    apiSendingEnabled: bool(raw.apiSendingEnabled, defaultSettings.apiSendingEnabled),
     openAfterUpload: bool(raw.openAfterUpload, defaultSettings.openAfterUpload),
     hideDuringCapture: bool(raw.hideDuringCapture, defaultSettings.hideDuringCapture),
     liveAreaSelection,
+    saveLocally: bool(raw.saveLocally, defaultSettings.saveLocally),
     launchOnStartup: bool(raw.launchOnStartup, defaultSettings.launchOnStartup),
   };
   return {
@@ -1180,12 +1186,16 @@ const DendroCaptureApp = () => {
     setLastCapture(target);
     setLastCaptureImage(pngBase64);
 
-    if (hasPairedDevice(deviceRef.current)) {
+    if (hasPairedDevice(deviceRef.current) && settingsRef.current.apiSendingEnabled) {
       const uploadItem: PendingCapture = { ...target };
-      await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
-        console.warn('Could not persist edited pending capture', error);
-      });
-      addPending(uploadItem);
+      let queuedForRetry = false;
+      if (settingsRef.current.saveLocally) {
+        await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
+          console.warn('Could not persist edited pending capture', error);
+        });
+        addPending(uploadItem);
+        queuedForRetry = true;
+      }
       setEditingCapture(null);
       setStatus('Uploading edited capture');
       try {
@@ -1197,7 +1207,9 @@ const DendroCaptureApp = () => {
         }
         setStatus('Edited capture uploaded');
       } catch (error) {
-        setStatus(`Edited capture queued: ${errorMessage(error, 'Upload failed')}`);
+        setStatus(queuedForRetry
+          ? `Edited capture queued: ${errorMessage(error, 'Upload failed')}`
+          : `Edited capture upload failed: ${errorMessage(error, 'Upload failed')}`);
       }
       return;
     }
@@ -1233,6 +1245,9 @@ const DendroCaptureApp = () => {
   };
 
   const uploadCapture = async (capture: UploadableCapture): Promise<{ openUrl?: string }> => {
+    if (!settingsRef.current.apiSendingEnabled) {
+      throw new Error('API sending is blocked in Connection settings');
+    }
     const uploadStep = async <T,>(label: string, action: () => Promise<T>): Promise<T> => {
       try {
         return await action();
@@ -1346,7 +1361,16 @@ const DendroCaptureApp = () => {
       previewBase64: await capturePreviewBase64(capture.pngBase64).catch(() => undefined),
     };
     setLastCapture(queuedItem);
-    if (!hasPairedDevice(deviceRef.current)) {
+
+    const pairedForUpload = hasPairedDevice(deviceRef.current);
+    const canSendToApi = pairedForUpload && settingsRef.current.apiSendingEnabled;
+    const shouldSaveLocally = settingsRef.current.saveLocally;
+
+    if (!canSendToApi) {
+      if (!shouldSaveLocally) {
+        setStatus(pairedForUpload ? 'Copied PNG, API sending blocked' : 'Copied PNG to clipboard');
+        return;
+      }
       try {
         const saved = await invoke<LocalCaptureSave>('save_local_capture', {
           filename: sourceName,
@@ -1360,17 +1384,24 @@ const DendroCaptureApp = () => {
         const savedCapture = { ...queuedItem, filePath: saved.filePath };
         addLocalCapture(savedCapture);
         setLastCapture(savedCapture);
-        setStatus('Saved locally');
+        setStatus(pairedForUpload ? 'Saved locally, API sending blocked' : 'Saved locally');
       } catch (error) {
         addLocalCapture(queuedItem);
         setStatus(`Copied PNG, local save failed: ${errorMessage(error, 'Unknown error')}`);
       }
       return;
     }
-    await invoke('save_pending_capture', { id: queuedItem.id, pngBase64: capture.pngBase64 }).catch((error) => {
-      console.warn('Could not persist pending capture', error);
-    });
-    addPending(queuedItem);
+
+    let queuedForRetry = false;
+    if (shouldSaveLocally) {
+      try {
+        await invoke('save_pending_capture', { id: queuedItem.id, pngBase64: capture.pngBase64 });
+        addPending(queuedItem);
+        queuedForRetry = true;
+      } catch (error) {
+        console.warn('Could not persist pending capture', error);
+      }
+    }
     setStatus('Uploading capture');
     try {
       const uploaded = await uploadCapture({ ...queuedItem, pngBase64: capture.pngBase64 });
@@ -1381,7 +1412,11 @@ const DendroCaptureApp = () => {
       }
       setStatus('Capture uploaded');
     } catch (error) {
-      setStatus(`Queued: ${errorMessage(error, 'Upload failed')}`);
+      if (queuedForRetry) {
+        setStatus(`Queued: ${errorMessage(error, 'Upload failed')}`);
+      } else {
+        setStatus(`Copied PNG, upload failed: ${errorMessage(error, 'Upload failed')}`);
+      }
     }
   };
 
@@ -1648,11 +1683,12 @@ const DendroCaptureApp = () => {
       if (liveSelection) {
         await hideMainWindowForCapture(true);
         const context = await readActiveWindowContext();
-        setStatus('Drag an area to capture. Esc cancels');
+        setStatus('Drag an area to capture. Right-click before release uses the delay. Esc cancels');
         const capture = await invoke<NativeCapture>('native_area_capture', {
           cursorX: cursor ? Math.round(cursor.x) : null,
           cursorY: cursor ? Math.round(cursor.y) : null,
           qualityScale: settingsRef.current.qualityScale,
+          delayedCaptureSeconds: clampNumber(settingsRef.current.delayedAreaCaptureSeconds, 0, 10),
         });
         await showMainWindow();
         busyRef.current = null;
@@ -1806,6 +1842,10 @@ const DendroCaptureApp = () => {
       setStatus('Pair DendroCapture before retrying queued uploads');
       return;
     }
+    if (!settingsRef.current.apiSendingEnabled) {
+      setStatus('API sending is blocked in Connection settings');
+      return;
+    }
     setBusy(`retry-${capture.id}`);
     setStatus('Retrying upload');
     try {
@@ -1824,6 +1864,10 @@ const DendroCaptureApp = () => {
       setStatus('Pair DendroCapture before retrying queued uploads');
       return;
     }
+    if (!settingsRef.current.apiSendingEnabled) {
+      setStatus('API sending is blocked in Connection settings');
+      return;
+    }
     for (const capture of pending) {
       // Keep this intentionally sequential so the API and worker are not flooded.
       await retryPending(capture);
@@ -1836,18 +1880,26 @@ const DendroCaptureApp = () => {
       setStatus('Pair DendroCapture before uploading this capture');
       return;
     }
+    if (!settingsRef.current.apiSendingEnabled) {
+      setStatus('API sending is blocked in Connection settings');
+      return;
+    }
     if (busyRef.current) return;
     const item: LocalCapture = latestCapture;
     busyRef.current = `upload-${item.id}`;
     setBusy(`upload-${item.id}`);
     setPreviewMenuOpen(false);
     setStatus('Uploading current capture');
+    let queuedForRetry = false;
     try {
       const pngBase64 = await originalPngForCapture(item);
-      await invoke('save_pending_capture', { id: item.id, pngBase64 }).catch((error) => {
-        console.warn('Could not persist manual upload queue item', error);
-      });
-      addPending(item);
+      if (settingsRef.current.saveLocally) {
+        await invoke('save_pending_capture', { id: item.id, pngBase64 }).catch((error) => {
+          console.warn('Could not persist manual upload queue item', error);
+        });
+        addPending(item);
+        queuedForRetry = true;
+      }
       const uploaded = await uploadCapture({ ...item, pngBase64 });
       const uploadedItem = uploaded.openUrl ? { ...item, assetUrl: uploaded.openUrl } : item;
       updateCaptureRecord(uploadedItem);
@@ -1863,7 +1915,9 @@ const DendroCaptureApp = () => {
       }
       setStatus('Current capture uploaded');
     } catch (error) {
-      setStatus(`Current capture queued: ${errorMessage(error, 'Upload failed')}`);
+      setStatus(queuedForRetry
+        ? `Current capture queued: ${errorMessage(error, 'Upload failed')}`
+        : `Current capture upload failed: ${errorMessage(error, 'Upload failed')}`);
     } finally {
       busyRef.current = null;
       setBusy(null);
@@ -2097,7 +2151,7 @@ const DendroCaptureApp = () => {
                       </button>
                       {previewMenuOpen && latestCapture ? (
                         <div className="dc-preview-menu-popover">
-                          <button type="button" onClick={() => void uploadLatestCapture()} disabled={!pairedDevice || !!busy}>
+                          <button type="button" onClick={() => void uploadLatestCapture()} disabled={!pairedDevice || !settings.apiSendingEnabled || !!busy}>
                             <UploadCloud size={14} />
                             <span>Upload to Dendro Assets</span>
                           </button>
@@ -2226,7 +2280,7 @@ const DendroCaptureApp = () => {
                     <h2>Upload Queue</h2>
                     <p>Only paired uploads that fail are stored here for retry.</p>
                   </div>
-                  <button type="button" className="dc-btn" disabled={!pending.length || !!busy} onClick={() => void retryAllPending()}>
+                  <button type="button" className="dc-btn" disabled={!pending.length || !settings.apiSendingEnabled || !!busy} onClick={() => void retryAllPending()}>
                     <RefreshCw size={14} />
                     Retry All
                   </button>
@@ -2246,7 +2300,7 @@ const DendroCaptureApp = () => {
                       <strong>{captureTitle(item)}</strong>
                       <small>{item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
                     </span>
-                    <button type="button" onClick={() => void retryPending(item)} disabled={!!busy}>
+                    <button type="button" onClick={() => void retryPending(item)} disabled={!settings.apiSendingEnabled || !!busy}>
                       <RefreshCw size={14} />
                     </button>
                   </div>
@@ -2266,6 +2320,14 @@ const DendroCaptureApp = () => {
                     Device name
                     <input value={settings.deviceName} onChange={(e) => updateSettings({ deviceName: e.target.value })} />
                   </label>
+                  <button
+                    type="button"
+                    className={`dc-api-toggle ${settings.apiSendingEnabled ? 'on' : 'off'}`}
+                    onClick={() => updateSettings({ apiSendingEnabled: !settings.apiSendingEnabled })}
+                  >
+                    {settings.apiSendingEnabled ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
+                    <span>{settings.apiSendingEnabled ? 'Sending to API' : 'Blocking API sending'}</span>
+                  </button>
                   <div className="dc-pair-row">
                     <input
                       placeholder="DCAP-XXXXX-XXXXX"
@@ -2355,13 +2417,27 @@ const DendroCaptureApp = () => {
                     />
                     Hide DendroCapture during capture
                   </label>
-                  <label className="dc-check">
+                  <label className="dc-check dc-check-with-hint">
                     <input
                       type="checkbox"
                       checked={settings.liveAreaSelection}
                       onChange={(e) => updateSettings({ liveAreaSelection: e.target.checked })}
                     />
-                    Live area selection
+                    <span>
+                      Live area selection
+                      <small>Keeps videos and other media rendering while you select an area. Right-click before release to use the delay.</small>
+                    </span>
+                  </label>
+                  <label className="dc-check dc-check-with-hint">
+                    <input
+                      type="checkbox"
+                      checked={settings.saveLocally}
+                      onChange={(e) => updateSettings({ saveLocally: e.target.checked })}
+                    />
+                    <span>
+                      Save captures locally
+                      <small>Turn off to keep captures out of local history and the retry queue.</small>
+                    </span>
                   </label>
                   <label className="dc-check">
                     <input
