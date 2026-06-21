@@ -1,0 +1,6 @@
+{
+  "Endpoint": "https://weu.codesigning.azure.net",
+  "CodeSigningAccountName": "dendro-studios-signing",
+  "CertificateProfileName": "dendro-studios-public",
+  "CorrelationId": "dendrocapture-local-build"
+}

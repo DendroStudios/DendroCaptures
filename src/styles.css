@@ -56,8 +56,8 @@
 
 body {
   margin: 0;
-  min-width: 740px;
-  min-height: 440px;
+  min-width: 820px;
+  min-height: 500px;
   overflow: hidden;
   background: var(--bg);
   color: var(--text);
@@ -1017,16 +1017,131 @@ kbd {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  overflow: hidden auto;
+  grid-template-rows: max-content minmax(0, 1fr);
+  gap: 12px;
+  overflow: hidden;
 }
 
 .dc-settings .dc-panel {
-  padding: 16px;
+  padding: 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.dc-settings-tabs {
+  min-height: 44px;
+  max-height: 48px;
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  overflow: hidden;
+  overflow-x: auto;
+  padding: 1px 2px 4px;
+  scrollbar-width: thin;
+}
+
+.dc-settings-tabs button {
+  flex: 1 0 118px;
+  max-width: 160px;
+  height: 40px;
+  min-width: 0;
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 12px;
+  line-height: 1;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.dc-settings-tabs button span {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dc-settings-tabs button:hover,
+.dc-settings-tabs button.active {
+  color: #fff;
+  border-color: rgba(91, 156, 255, 0.56);
+  background: rgba(91, 156, 255, 0.12);
+  box-shadow: 0 0 0 3px rgba(91, 156, 255, 0.08);
+}
+
+.dc-settings-tabs button svg {
+  color: var(--blue-2);
+}
+
+.dc-settings-content {
+  min-height: 0;
+  overflow: hidden auto;
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.dc-destination-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dc-destination-option {
+  min-width: 0;
+  min-height: 72px;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  text-align: left;
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease, color 160ms ease;
+}
+
+.dc-destination-option svg {
+  color: var(--blue-2);
+}
+
+.dc-destination-option span,
+.dc-destination-option strong,
+.dc-destination-option small {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dc-destination-option strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.dc-destination-option small {
+  margin-top: 4px;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.dc-destination-option:hover,
+.dc-destination-option.active {
+  color: #fff;
+  border-color: rgba(91, 156, 255, 0.56);
+  background: rgba(91, 156, 255, 0.12);
+  box-shadow: 0 0 0 3px rgba(91, 156, 255, 0.08);
 }
 
 .dc-settings label {
@@ -1034,6 +1149,7 @@ kbd {
   gap: 8px;
   color: var(--muted);
   font-size: 13px;
+  line-height: 1.35;
 }
 
 .dc-settings label b {
@@ -1047,6 +1163,7 @@ kbd {
   background: rgba(0, 0, 0, 0.30);
   color: var(--text);
   padding: 12px 13px;
+  line-height: 1.25;
   transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
 }
 
@@ -1105,6 +1222,177 @@ kbd {
 .dc-device span {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.dc-drive-status {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  border: 1px solid rgba(84, 216, 137, 0.22);
+  border-radius: 8px;
+  color: var(--green);
+  background: rgba(84, 216, 137, 0.07);
+}
+
+.dc-drive-status.warning {
+  color: var(--yellow);
+  border-color: rgba(255, 200, 87, 0.26);
+  background: rgba(255, 200, 87, 0.07);
+}
+
+.dc-drive-help {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(151, 184, 224, 0.14);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.dc-drive-steps {
+  display: grid;
+  gap: 10px;
+}
+
+.dc-drive-step {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(132px, auto);
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid rgba(151, 184, 224, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.dc-drive-step-index {
+  width: 24px;
+  height: 24px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid rgba(132, 189, 255, 0.34);
+  border-radius: 999px;
+  color: var(--blue-2);
+  background: rgba(91, 156, 255, 0.12);
+  font-weight: 900;
+}
+
+.dc-drive-step-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.dc-drive-step-copy strong,
+.dc-drive-step-copy small,
+.dc-drive-substeps span {
+  display: block;
+}
+
+.dc-drive-step-copy small,
+.dc-drive-substeps {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.dc-drive-substeps {
+  display: grid;
+  gap: 3px;
+  margin-top: 3px;
+}
+
+.dc-drive-substeps span::before {
+  content: "- ";
+  color: var(--blue-2);
+}
+
+.dc-drive-step .dc-btn {
+  min-width: 0;
+  min-height: 36px;
+  height: auto;
+  padding: 7px 10px;
+  line-height: 1.15;
+  white-space: normal;
+}
+
+.dc-drive-next-step {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.dc-drive-troubleshoot {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 200, 87, 0.26);
+  border-radius: 8px;
+  color: var(--yellow);
+  background: rgba(255, 200, 87, 0.07);
+}
+
+.dc-drive-troubleshoot strong,
+.dc-drive-troubleshoot small {
+  display: block;
+}
+
+.dc-drive-troubleshoot small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.dc-drive-note {
+  color: var(--yellow);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.dc-inline-link {
+  justify-self: start;
+  border: 0;
+  padding: 0;
+  color: var(--blue-2);
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+}
+
+.dc-inline-link:hover {
+  color: #fff;
+  text-decoration: underline;
+}
+
+.dc-drive-status span,
+.dc-drive-status strong,
+.dc-drive-status small {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dc-drive-status small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dc-drive-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .dc-check {
@@ -1691,7 +1979,8 @@ kbd {
   }
 
   .dc-settings {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
+    grid-template-rows: max-content minmax(0, 1fr);
   }
 
   .dc-capture-dashboard {
@@ -1829,8 +2118,21 @@ kbd {
 }
 
 @media (max-width: 700px) {
-  .dc-capture-dashboard,
-  .dc-settings {
+  .dc-capture-dashboard {
+    grid-template-columns: 1fr;
+  }
+
+  .dc-settings-tabs {
+    max-height: 92px;
+    flex-wrap: wrap;
+    overflow-x: hidden;
+  }
+
+  .dc-destination-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dc-drive-step {
     grid-template-columns: 1fr;
   }
 

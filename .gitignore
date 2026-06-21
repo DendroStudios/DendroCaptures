@@ -26,6 +26,7 @@ pending-captures/
 *.crt
 *.cer
 secrets.*
+src-tauri/artifact-signing.metadata.json
 
 # Logs and caches
 *.log

@@ -1,20 +1,48 @@
 use arboard::{Clipboard, ImageData};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use image::{imageops, DynamicImage, ImageOutputFormat, RgbaImage};
 use keyring::Entry;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
+use reqwest::multipart;
 use screenshots::Screen;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, fs, io::Cursor, path::{Path, PathBuf}};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fs,
+    io::{Cursor, Read, Write},
+    net::TcpListener,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, Runtime,
 };
 
+// Keep the keyring service and keys stable across releases; version-over-version
+// installs rely on them to preserve Dendro pairing and Google Drive credentials.
 const KEYRING_SERVICE: &str = "DendroCapture";
 const KEYRING_DEVICE_KEY: &str = "device-ed25519";
+const KEYRING_GOOGLE_DRIVE_TOKEN_KEY: &str = "google-drive";
+const GOOGLE_DRIVE_FOLDER_NAME: &str = "DendroCapture";
+const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file openid email profile";
+const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+const GOOGLE_DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
+static GOOGLE_DRIVE_DAY_FOLDER_CACHE: OnceLock<Mutex<HashMap<(String, String), GoogleDriveFile>>> =
+    OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +116,114 @@ pub struct ActiveWindowContext {
     window_title: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveStatus {
+    configured: bool,
+    linked: bool,
+    has_client_secret: bool,
+    client_id: Option<String>,
+    email: Option<String>,
+    folder_id: Option<String>,
+    folder_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveLinkResult {
+    email: Option<String>,
+    folder_id: String,
+    folder_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveUploadCapture {
+    filename: String,
+    png_base64: String,
+    day_folder_name: Option<String>,
+    capture_id: String,
+    captured_at: String,
+    mode: String,
+    width: u32,
+    height: u32,
+    display_width: u32,
+    display_height: u32,
+    scale_factor: f64,
+    app_name: Option<String>,
+    window_title: Option<String>,
+    ocr_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveUploadResult {
+    file_id: String,
+    web_view_link: Option<String>,
+    folder_view_link: Option<String>,
+    ocr_indexed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveOcrUpdate {
+    file_id: String,
+    capture_id: String,
+    captured_at: String,
+    mode: String,
+    width: u32,
+    height: u32,
+    display_width: u32,
+    display_height: u32,
+    scale_factor: f64,
+    app_name: Option<String>,
+    window_title: Option<String>,
+    ocr_text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleDriveOcrUpdateResult {
+    ocr_indexed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDriveStoredState {
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+    refresh_token: String,
+    email: Option<String>,
+    folder_id: String,
+    folder_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleUserInfo {
+    email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GoogleDriveFile {
+    id: String,
+    name: Option<String>,
+    web_view_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleDriveFilesList {
+    files: Vec<GoogleDriveFile>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureRegionRect {
@@ -134,12 +270,519 @@ fn load_or_create_signing_key() -> Result<SigningKey, String> {
     Ok(signing_key)
 }
 
+fn google_drive_entry() -> Result<Entry, String> {
+    Entry::new(KEYRING_SERVICE, KEYRING_GOOGLE_DRIVE_TOKEN_KEY).map_err(err)
+}
+
+fn clean_google_client_id(client_id: &str) -> Result<String, String> {
+    let clean = client_id.replace('\0', "").trim().to_string();
+    if clean.is_empty() {
+        return Err(
+            "Paste a Google OAuth desktop client ID in Google Drive settings first".to_string(),
+        );
+    }
+    if clean.len() > 260 {
+        return Err("Google OAuth client ID is too long".to_string());
+    }
+    Ok(clean)
+}
+
+fn clean_google_client_secret(client_secret: &str) -> Result<String, String> {
+    let clean = client_secret.replace('\0', "").trim().to_string();
+    if clean.is_empty() {
+        return Err(
+            "Paste the Google OAuth desktop client secret in Google Drive settings first"
+                .to_string(),
+        );
+    }
+    if clean.ends_with(".apps.googleusercontent.com") {
+        return Err(
+            "Paste the OAuth Client Secret, not the Client ID, in the secret field".to_string(),
+        );
+    }
+    if clean.len() > 260 {
+        return Err("Google OAuth client secret is too long".to_string());
+    }
+    Ok(clean)
+}
+
+fn clean_google_drive_file_id(file_id: &str) -> Result<String, String> {
+    let clean = file_id.replace('\0', "").trim().to_string();
+    if clean.is_empty() {
+        return Err("Google Drive file id is missing".to_string());
+    }
+    if clean.len() > 160 {
+        return Err("Google Drive file id is too long".to_string());
+    }
+    if !clean
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err("Google Drive file id contains unexpected characters".to_string());
+    }
+    Ok(clean)
+}
+
+fn load_google_drive_state() -> Result<Option<GoogleDriveStoredState>, String> {
+    let entry = google_drive_entry()?;
+    match entry.get_password() {
+        Ok(raw) => serde_json::from_str::<GoogleDriveStoredState>(&raw)
+            .map(Some)
+            .map_err(err),
+        Err(_) => Ok(None),
+    }
+}
+
+fn save_google_drive_state(state: &GoogleDriveStoredState) -> Result<(), String> {
+    google_drive_entry()?
+        .set_password(&serde_json::to_string(state).map_err(err)?)
+        .map_err(err)
+}
+
+fn clear_google_drive_state() -> Result<(), String> {
+    match google_drive_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            if message.to_ascii_lowercase().contains("no entry") {
+                Ok(())
+            } else {
+                Err(message)
+            }
+        }
+    }
+}
+
+fn google_drive_day_folder_cache() -> &'static Mutex<HashMap<(String, String), GoogleDriveFile>> {
+    GOOGLE_DRIVE_DAY_FOLDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn oauth_random_urlsafe(byte_count: usize) -> String {
+    let mut bytes = vec![0_u8; byte_count];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn oauth_pkce_pair() -> (String, String) {
+    let verifier = oauth_random_urlsafe(48);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+fn decode_query_value(value: &str) -> String {
+    urlencoding::decode(value)
+        .map(Cow::into_owned)
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn parse_oauth_query(target: &str) -> Vec<(String, String)> {
+    let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+    query
+        .split('&')
+        .filter_map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((decode_query_value(key), decode_query_value(value)))
+        })
+        .collect()
+}
+
+fn write_oauth_response(mut stream: std::net::TcpStream, title: &str, body: &str) {
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body style=\"font-family:system-ui,sans-serif;padding:32px\"><h1>{title}</h1><p>{body}</p><script>setTimeout(() => window.close(), 800);</script></body></html>"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.as_bytes().len(),
+        html
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn wait_for_oauth_callback(
+    listener: TcpListener,
+    expected_state: String,
+) -> Result<String, String> {
+    listener.set_nonblocking(true).map_err(err)?;
+    let started = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).map_err(err)?;
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let request_line = request.lines().next().unwrap_or("");
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or_else(|| "Google OAuth callback was malformed".to_string())?;
+                let params = parse_oauth_query(target);
+                let state = params
+                    .iter()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default();
+                if state != expected_state {
+                    write_oauth_response(
+                        stream,
+                        "DendroCapture Google Drive",
+                        "The OAuth state did not match. You can close this tab.",
+                    );
+                    return Err("Google OAuth state did not match".to_string());
+                }
+                if let Some((_, error)) = params.iter().find(|(key, _)| key == "error") {
+                    write_oauth_response(
+                        stream,
+                        "DendroCapture Google Drive",
+                        "Google Drive linking was cancelled. You can close this tab.",
+                    );
+                    return Err(format!("Google OAuth failed: {error}"));
+                }
+                let code = params
+                    .iter()
+                    .find(|(key, _)| key == "code")
+                    .map(|(_, value)| value.clone())
+                    .ok_or_else(|| {
+                        "Google OAuth callback did not include an authorization code".to_string()
+                    })?;
+                write_oauth_response(
+                    stream,
+                    "DendroCapture Google Drive approval received",
+                    "Return to DendroCapture to finish linking Google Drive.",
+                );
+                return Ok(code);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() > Duration::from_secs(180) {
+                    return Err("Google Drive linking timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+async fn google_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<T, String> {
+    let status = response.status();
+    let text = response.text().await.map_err(err)?;
+    if !status.is_success() {
+        let reason = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error_description")
+                    .or_else(|| value.get("error"))
+                    .and_then(|error| error.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("Google returned HTTP {status}"));
+        return Err(format!("{label} failed: {reason}"));
+    }
+    serde_json::from_str::<T>(&text)
+        .map_err(|error| format!("{label} returned unreadable JSON: {error}"))
+}
+
+async fn exchange_google_oauth_code(
+    client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<GoogleTokenResponse, String> {
+    let response = client
+        .post(GOOGLE_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach Google OAuth token endpoint: {error}"))?;
+    google_json(response, "Google token exchange").await
+}
+
+async fn refresh_google_access_token(
+    client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<String, String> {
+    let response = client
+        .post(GOOGLE_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not refresh Google Drive access: {error}"))?;
+    let token: GoogleTokenResponse = google_json(response, "Google token refresh").await?;
+    Ok(token.access_token)
+}
+
+async fn google_drive_access_token(
+    client: &reqwest::Client,
+    state: &GoogleDriveStoredState,
+) -> Result<String, String> {
+    let client_id = clean_google_client_id(&state.client_id)?;
+    let client_secret = clean_google_client_secret(&state.client_secret)
+        .map_err(|_| "Google Drive was linked without a client secret. Unlink Google Drive, paste the Client ID and Client Secret, then link again.".to_string())?;
+    refresh_google_access_token(client, &client_id, &client_secret, &state.refresh_token).await
+}
+
+async fn google_user_email(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<Option<String>, String> {
+    let response = client
+        .get(GOOGLE_USERINFO_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| format!("Could not read Google account profile: {error}"))?;
+    let info: GoogleUserInfo = google_json(response, "Google account profile").await?;
+    Ok(info.email)
+}
+
+async fn find_or_create_google_drive_folder(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<GoogleDriveFile, String> {
+    find_or_create_google_drive_folder_named(client, access_token, GOOGLE_DRIVE_FOLDER_NAME, None)
+        .await
+}
+
+async fn find_or_create_google_drive_child_folder(
+    client: &reqwest::Client,
+    access_token: &str,
+    parent_id: &str,
+    name: &str,
+) -> Result<GoogleDriveFile, String> {
+    let cache_key = (parent_id.to_string(), name.to_string());
+    if let Ok(cache) = google_drive_day_folder_cache().lock() {
+        if let Some(folder) = cache.get(&cache_key).cloned() {
+            return Ok(folder);
+        }
+    }
+
+    let folder =
+        find_or_create_google_drive_folder_named(client, access_token, name, Some(parent_id))
+            .await?;
+    if let Ok(mut cache) = google_drive_day_folder_cache().lock() {
+        cache.insert(cache_key, folder.clone());
+    }
+    Ok(folder)
+}
+
+async fn find_or_create_google_drive_folder_named(
+    client: &reqwest::Client,
+    access_token: &str,
+    folder_name: &str,
+    parent_id: Option<&str>,
+) -> Result<GoogleDriveFile, String> {
+    let mut query_parts = vec![
+        "mimeType='application/vnd.google-apps.folder'".to_string(),
+        format!("name='{}'", drive_query_literal(folder_name)),
+        "trashed=false".to_string(),
+    ];
+    if let Some(parent_id) = parent_id {
+        query_parts.push(format!("'{}' in parents", drive_query_literal(parent_id)));
+    }
+    let query = format!("{}", query_parts.join(" and "));
+    let response = client
+        .get(format!("{GOOGLE_DRIVE_API_BASE}/files"))
+        .bearer_auth(access_token)
+        .query(&[
+            ("q", query.as_str()),
+            ("spaces", "drive"),
+            ("fields", "files(id,name)"),
+            ("pageSize", "1"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Could not search Google Drive folders: {error}"))?;
+    let list: GoogleDriveFilesList = google_json(response, "Google Drive folder lookup").await?;
+    if let Some(folder) = list.files.into_iter().next() {
+        return Ok(folder);
+    }
+
+    let mut metadata = json!({
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder"
+    });
+    if let Some(parent_id) = parent_id {
+        metadata["parents"] = json!([parent_id]);
+    }
+
+    let response = client
+        .post(format!("{GOOGLE_DRIVE_API_BASE}/files"))
+        .bearer_auth(access_token)
+        .query(&[("fields", "id,name")])
+        .json(&metadata)
+        .send()
+        .await
+        .map_err(|error| format!("Could not create Google Drive folder: {error}"))?;
+    google_json(response, "Google Drive folder creation").await
+}
+
+fn drive_query_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn google_drive_folder_url(folder_id: &str) -> String {
+    format!(
+        "https://drive.google.com/drive/u/0/folders/{}",
+        urlencoding::encode(folder_id)
+    )
+}
+
+fn fallback_drive_day_folder_name(captured_at: &str) -> String {
+    let date = captured_at
+        .get(0..10)
+        .filter(|value| {
+            let bytes = value.as_bytes();
+            bytes.len() == 10
+                && bytes[4] == b'-'
+                && bytes[7] == b'-'
+                && bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+        })
+        .unwrap_or("unknown-date");
+    format!("dendrocapture-{date}")
+}
+
+fn safe_drive_folder_name(folder_name: Option<&str>, captured_at: &str) -> String {
+    let candidate = folder_name
+        .map(|value| value.replace('\0', " ").trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback_drive_day_folder_name(captured_at));
+    candidate.chars().take(120).collect()
+}
+
+fn clean_and_truncate_text(text: &str, max_bytes: usize) -> Option<String> {
+    let clean = text.replace('\0', " ").trim().to_string();
+    if clean.is_empty() {
+        return None;
+    }
+    if clean.len() <= max_bytes {
+        return Some(clean);
+    }
+    let mut truncated = String::with_capacity(max_bytes);
+    for ch in clean.chars() {
+        if truncated.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        truncated.push(ch);
+    }
+    Some(truncated)
+}
+
+fn truncate_indexable_text(text: &str) -> Option<String> {
+    clean_and_truncate_text(text, 128 * 1024)
+}
+
+fn clean_drive_app_property(value: impl ToString, max_len: usize) -> String {
+    value
+        .to_string()
+        .replace('\0', " ")
+        .chars()
+        .take(max_len)
+        .collect()
+}
+
+fn google_drive_description_parts(
+    captured_at: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    app_name: Option<&str>,
+    window_title: Option<&str>,
+    ocr_text: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        "DendroCapture screenshot".to_string(),
+        format!("Captured at: {captured_at}"),
+        format!("Mode: {mode}"),
+        format!("Dimensions: {width} x {height}"),
+    ];
+
+    if let Some(app_name) = app_name.map(str::trim).filter(|value| !value.is_empty()) {
+        lines.push(format!("Source app: {app_name}"));
+    }
+
+    if let Some(window_title) = window_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!("Window title: {window_title}"));
+    }
+
+    if let Some(text) = ocr_text.and_then(|value| clean_and_truncate_text(value, 22_000)) {
+        lines.push(String::new());
+        lines.push("OCR text:".to_string());
+        lines.push(text);
+    }
+
+    clean_and_truncate_text(&lines.join("\n"), 24_000)
+        .unwrap_or_else(|| "DendroCapture screenshot".to_string())
+}
+
+fn google_drive_description(payload: &GoogleDriveUploadCapture, ocr_text: Option<&str>) -> String {
+    google_drive_description_parts(
+        &payload.captured_at,
+        &payload.mode,
+        payload.width,
+        payload.height,
+        payload.app_name.as_deref(),
+        payload.window_title.as_deref(),
+        ocr_text,
+    )
+}
+
+fn google_drive_ocr_description(payload: &GoogleDriveOcrUpdate, ocr_text: Option<&str>) -> String {
+    google_drive_description_parts(
+        &payload.captured_at,
+        &payload.mode,
+        payload.width,
+        payload.height,
+        payload.app_name.as_deref(),
+        payload.window_title.as_deref(),
+        ocr_text,
+    )
+}
+
+fn safe_drive_filename(filename: &str) -> String {
+    safe_local_capture_filename(filename)
+}
+
 fn encode_png(mut image: RgbaImage, quality_scale: f64) -> Result<(Vec<u8>, u32, u32), String> {
     let scale = quality_scale.clamp(0.25, 1.0);
     if scale < 0.999 {
         let next_width = ((image.width() as f64) * scale).round().max(1.0) as u32;
         let next_height = ((image.height() as f64) * scale).round().max(1.0) as u32;
-        image = imageops::resize(&image, next_width, next_height, imageops::FilterType::CatmullRom);
+        image = imageops::resize(
+            &image,
+            next_width,
+            next_height,
+            imageops::FilterType::CatmullRom,
+        );
     }
     let (width, height) = (image.width(), image.height());
     // Screen captures are opaque; dropping the alpha channel makes the PNG
@@ -264,14 +907,27 @@ fn safe_local_capture_filename(filename: &str) -> String {
     }
 }
 
+fn capture_month_from_filename(filename: &str) -> String {
+    let bytes = filename.as_bytes();
+    if bytes.len() < 9 {
+        return "captures".to_string();
+    }
+    for index in (0..=bytes.len() - 9).rev() {
+        let maybe_date = &bytes[index..index + 8];
+        if maybe_date.iter().all(u8::is_ascii_digit) && bytes.get(index + 8) == Some(&b'T') {
+            return format!(
+                "{}-{}",
+                String::from_utf8_lossy(&maybe_date[0..4]),
+                String::from_utf8_lossy(&maybe_date[4..6]),
+            );
+        }
+    }
+    "captures".to_string()
+}
+
 fn local_capture_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
     let safe_filename = safe_local_capture_filename(filename);
-    let month = safe_filename
-        .split('-')
-        .nth(2)
-        .and_then(|date| date.get(0..6))
-        .map(|date| format!("{}-{}", &date[0..4], &date[4..6]))
-        .unwrap_or_else(|| "captures".to_string());
+    let month = capture_month_from_filename(&safe_filename);
     let dir = app
         .path()
         .app_data_dir()
@@ -303,7 +959,11 @@ fn validated_local_capture_path(app: &AppHandle, path: &str) -> Result<PathBuf, 
 }
 
 #[tauri::command]
-async fn save_pending_capture(app: AppHandle, id: String, png_base64: String) -> Result<(), String> {
+async fn save_pending_capture(
+    app: AppHandle,
+    id: String,
+    png_base64: String,
+) -> Result<(), String> {
     let bytes = BASE64.decode(png_base64).map_err(err)?;
     let path = pending_capture_path(&app, &id)?;
     fs::write(path, bytes).map_err(err)
@@ -400,6 +1060,12 @@ async fn reveal_pending_capture(app: AppHandle, id: String) -> Result<(), String
     tauri_plugin_opener::reveal_item_in_dir(&path).map_err(err)
 }
 
+#[tauri::command]
+async fn local_captures_root_path(app: AppHandle) -> Result<String, String> {
+    let path = local_captures_root(&app)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 // Async: keyring access talks to the OS credential store and must never be
 // able to stall the main thread (a blocked main thread makes the tray and
 // window controls unresponsive - the app looks alive but nothing reacts).
@@ -416,6 +1082,237 @@ async fn sign_challenge(challenge_id: String, challenge: String) -> Result<Strin
     let signing_key = load_or_create_signing_key()?;
     let message = format!("dendro-capture:{challenge_id}:{challenge}");
     Ok(BASE64.encode(signing_key.sign(message.as_bytes()).to_bytes()))
+}
+
+#[tauri::command]
+async fn google_drive_status(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<GoogleDriveStatus, String> {
+    let state = load_google_drive_state()?;
+    let input_has_client_id = client_id
+        .as_deref()
+        .and_then(|value| clean_google_client_id(value).ok())
+        .is_some();
+    let input_has_client_secret = client_secret
+        .as_deref()
+        .and_then(|value| clean_google_client_secret(value).ok())
+        .is_some();
+    let stored_has_client_id = state
+        .as_ref()
+        .map(|value| clean_google_client_id(&value.client_id).is_ok())
+        .unwrap_or(false);
+    let stored_has_client_secret = state
+        .as_ref()
+        .map(|value| clean_google_client_secret(&value.client_secret).is_ok())
+        .unwrap_or(false);
+    let has_client_secret = input_has_client_secret || stored_has_client_secret;
+    let linked = state.is_some() && stored_has_client_id && stored_has_client_secret;
+    let configured = (input_has_client_id && input_has_client_secret)
+        || (stored_has_client_id && stored_has_client_secret);
+    Ok(GoogleDriveStatus {
+        configured,
+        linked,
+        has_client_secret,
+        client_id: state.as_ref().map(|value| value.client_id.clone()),
+        email: state.as_ref().and_then(|value| value.email.clone()),
+        folder_id: state.as_ref().map(|value| value.folder_id.clone()),
+        folder_name: state.as_ref().map(|value| value.folder_name.clone()),
+    })
+}
+
+#[tauri::command]
+async fn google_drive_link(
+    client_id: String,
+    client_secret: String,
+) -> Result<GoogleDriveLinkResult, String> {
+    let client_id = clean_google_client_id(&client_id)?;
+    let client_secret = clean_google_client_secret(&client_secret)?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(err)?;
+    let port = listener.local_addr().map_err(err)?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/");
+    let state = oauth_random_urlsafe(32);
+    let (verifier, challenge) = oauth_pkce_pair();
+    let auth_url = format!(
+        "{GOOGLE_AUTH_URL}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
+        urlencoding::encode(&client_id),
+        urlencoding::encode(&redirect_uri),
+        urlencoding::encode(GOOGLE_DRIVE_SCOPE),
+        urlencoding::encode(&challenge),
+        urlencoding::encode(&state),
+    );
+
+    tauri_plugin_opener::open_url(auth_url, None::<&str>)
+        .map_err(|error| format!("Could not open Google sign-in in your browser: {error}"))?;
+
+    let code =
+        tauri::async_runtime::spawn_blocking(move || wait_for_oauth_callback(listener, state))
+            .await
+            .map_err(err)??;
+    let client = reqwest::Client::new();
+    let token = exchange_google_oauth_code(
+        &client,
+        &client_id,
+        &client_secret,
+        &code,
+        &verifier,
+        &redirect_uri,
+    )
+    .await?;
+    let refresh_token = token.refresh_token.ok_or_else(|| {
+        "Google did not return a refresh token. Unlink Google Drive and try linking again."
+            .to_string()
+    })?;
+    let email = google_user_email(&client, &token.access_token)
+        .await
+        .unwrap_or(None);
+    let folder = find_or_create_google_drive_folder(&client, &token.access_token).await?;
+    let folder_name = folder
+        .name
+        .unwrap_or_else(|| GOOGLE_DRIVE_FOLDER_NAME.to_string());
+    let stored = GoogleDriveStoredState {
+        client_id,
+        client_secret,
+        refresh_token,
+        email: email.clone(),
+        folder_id: folder.id.clone(),
+        folder_name: folder_name.clone(),
+    };
+    save_google_drive_state(&stored)?;
+
+    Ok(GoogleDriveLinkResult {
+        email,
+        folder_id: folder.id,
+        folder_name,
+    })
+}
+
+#[tauri::command]
+async fn google_drive_unlink() -> Result<(), String> {
+    clear_google_drive_state()
+}
+
+#[tauri::command]
+async fn google_drive_upload_capture(
+    payload: GoogleDriveUploadCapture,
+) -> Result<GoogleDriveUploadResult, String> {
+    let state = load_google_drive_state()?
+        .ok_or_else(|| "Link Google Drive before uploading captures".to_string())?;
+    let client = reqwest::Client::new();
+    let access_token = google_drive_access_token(&client, &state).await?;
+    let png = BASE64.decode(payload.png_base64.as_bytes()).map_err(err)?;
+
+    let filename = safe_drive_filename(&payload.filename);
+    let day_folder_name =
+        safe_drive_folder_name(payload.day_folder_name.as_deref(), &payload.captured_at);
+    let day_folder = find_or_create_google_drive_child_folder(
+        &client,
+        &access_token,
+        &state.folder_id,
+        &day_folder_name,
+    )
+    .await?;
+    let day_folder_id = day_folder.id.clone();
+    let indexable_text = payload
+        .ocr_text
+        .as_deref()
+        .and_then(truncate_indexable_text);
+    let ocr_indexed = indexable_text.is_some();
+    let description = google_drive_description(&payload, indexable_text.as_deref());
+    let mut metadata = json!({
+        "name": filename.clone(),
+        "mimeType": "image/png",
+        "parents": [day_folder_id],
+        "description": description,
+        "appProperties": {
+            "dendroCaptureId": clean_drive_app_property(&payload.capture_id, 120),
+            "capturedAt": clean_drive_app_property(&payload.captured_at, 64),
+            "driveDayFolder": clean_drive_app_property(&day_folder_name, 120),
+            "mode": clean_drive_app_property(&payload.mode, 24),
+            "width": payload.width.to_string(),
+            "height": payload.height.to_string(),
+            "displayWidth": payload.display_width.to_string(),
+            "displayHeight": payload.display_height.to_string(),
+            "scaleFactor": clean_drive_app_property(payload.scale_factor, 24),
+        }
+    });
+    if let Some(text) = indexable_text.as_deref() {
+        metadata["contentHints"] = json!({ "indexableText": text });
+    }
+
+    let metadata_part = multipart::Part::bytes(serde_json::to_vec(&metadata).map_err(err)?)
+        .mime_str("application/json; charset=UTF-8")
+        .map_err(err)?;
+    let media_part = multipart::Part::bytes(png)
+        .file_name(filename)
+        .mime_str("image/png")
+        .map_err(err)?;
+    let form = multipart::Form::new()
+        .part("metadata", metadata_part)
+        .part("media", media_part);
+    let response = client
+        .post(format!("{GOOGLE_DRIVE_UPLOAD_BASE}/files"))
+        .bearer_auth(access_token)
+        .query(&[
+            ("uploadType", "multipart"),
+            ("fields", "id,name,webViewLink"),
+        ])
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| format!("Could not upload capture to Google Drive: {error}"))?;
+    let uploaded: GoogleDriveFile = google_json(response, "Google Drive capture upload").await?;
+    Ok(GoogleDriveUploadResult {
+        file_id: uploaded.id,
+        web_view_link: uploaded.web_view_link,
+        folder_view_link: Some(google_drive_folder_url(&day_folder.id)),
+        ocr_indexed,
+    })
+}
+
+#[tauri::command]
+async fn google_drive_update_capture_ocr(
+    payload: GoogleDriveOcrUpdate,
+) -> Result<GoogleDriveOcrUpdateResult, String> {
+    let state = load_google_drive_state()?
+        .ok_or_else(|| "Link Google Drive before updating OCR metadata".to_string())?;
+    let file_id = clean_google_drive_file_id(&payload.file_id)?;
+    let indexable_text = match truncate_indexable_text(&payload.ocr_text) {
+        Some(text) => text,
+        None => return Ok(GoogleDriveOcrUpdateResult { ocr_indexed: false }),
+    };
+    let client = reqwest::Client::new();
+    let access_token = google_drive_access_token(&client, &state).await?;
+    let description = google_drive_ocr_description(&payload, Some(&indexable_text));
+    let metadata = json!({
+        "description": description,
+        "contentHints": {
+            "indexableText": indexable_text,
+        },
+        "appProperties": {
+            "dendroCaptureId": clean_drive_app_property(&payload.capture_id, 120),
+            "capturedAt": clean_drive_app_property(&payload.captured_at, 64),
+            "mode": clean_drive_app_property(&payload.mode, 24),
+            "width": payload.width.to_string(),
+            "height": payload.height.to_string(),
+            "displayWidth": payload.display_width.to_string(),
+            "displayHeight": payload.display_height.to_string(),
+            "scaleFactor": clean_drive_app_property(payload.scale_factor, 24),
+        }
+    });
+    let response = client
+        .patch(format!(
+            "{GOOGLE_DRIVE_API_BASE}/files/{}",
+            urlencoding::encode(&file_id)
+        ))
+        .bearer_auth(access_token)
+        .query(&[("fields", "id")])
+        .json(&metadata)
+        .send()
+        .await
+        .map_err(|error| format!("Could not update Google Drive OCR metadata: {error}"))?;
+    let _: GoogleDriveFile = google_json(response, "Google Drive OCR metadata update").await?;
+    Ok(GoogleDriveOcrUpdateResult { ocr_indexed: true })
 }
 
 #[tauri::command]
@@ -502,7 +1399,10 @@ async fn begin_area_capture(
 }
 
 #[tauri::command]
-async fn finish_area_capture(rect: CaptureRegionRect, quality_scale: f64) -> Result<CaptureResult, String> {
+async fn finish_area_capture(
+    rect: CaptureRegionRect,
+    quality_scale: f64,
+) -> Result<CaptureResult, String> {
     let screen = screen_for_point(Some(rect.x), Some(rect.y))?;
     let info = screen.display_info;
     let image = screen.capture().map_err(err)?;
@@ -608,7 +1508,10 @@ struct NativeSelectionHookContext {
 static mut NATIVE_SELECTION_HOOK_CONTEXT: *mut NativeSelectionHookContext = std::ptr::null_mut();
 
 #[cfg(target_os = "windows")]
-fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
+fn native_select_region_alpha_window(
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
+) -> Result<NativeSelectionResult, String> {
     use std::{ffi::c_void, mem::zeroed, ptr::null_mut};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow};
@@ -616,27 +1519,57 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         GetAsyncKeyState, ReleaseCapture, SetCapture, VK_ESCAPE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetWindowLongPtrW,
-        LoadCursorW, PeekMessageW, RegisterClassW, SetCursor,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+        GetWindowLongPtrW, LoadCursorW, PeekMessageW, RegisterClassW, SetCursor,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-        IDC_CROSS, LWA_ALPHA, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, WM_CREATE, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_RBUTTONDOWN, WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA,
+        MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WM_CREATE,
+        WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_SETCURSOR,
+        WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     };
 
     const INPUT_CLASS: &[u16] = &[
-        b'D' as u16, b'e' as u16, b'n' as u16, b'd' as u16, b'r' as u16, b'o' as u16,
-        b'C' as u16, b'a' as u16, b'p' as u16, b't' as u16, b'u' as u16, b'r' as u16,
-        b'e' as u16, b'I' as u16, b'n' as u16, b'p' as u16, b'u' as u16, b't' as u16,
+        b'D' as u16,
+        b'e' as u16,
+        b'n' as u16,
+        b'd' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'C' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b'I' as u16,
+        b'n' as u16,
+        b'p' as u16,
+        b'u' as u16,
+        b't' as u16,
         0,
     ];
     const BORDER_CLASS: &[u16] = &[
-        b'D' as u16, b'e' as u16, b'n' as u16, b'd' as u16, b'r' as u16, b'o' as u16,
-        b'C' as u16, b'a' as u16, b'p' as u16, b't' as u16, b'u' as u16, b'r' as u16,
-        b'e' as u16, b'B' as u16, b'o' as u16, b'r' as u16, b'd' as u16, b'e' as u16,
-        b'r' as u16, 0,
+        b'D' as u16,
+        b'e' as u16,
+        b'n' as u16,
+        b'd' as u16,
+        b'r' as u16,
+        b'o' as u16,
+        b'C' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b't' as u16,
+        b'u' as u16,
+        b'r' as u16,
+        b'e' as u16,
+        b'B' as u16,
+        b'o' as u16,
+        b'r' as u16,
+        b'd' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        0,
     ];
     const BORDER_COLOR: u32 = 0x00ffbd84;
     const BORDER_THICKNESS: i32 = 2;
@@ -716,10 +1649,20 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         let scale_y = state.capture_height as f64 / f64::from(client_height);
         let x = state.origin_x + (f64::from(left) * scale_x).round() as i32;
         let y = state.origin_y + (f64::from(top) * scale_y).round() as i32;
-        let width = (f64::from((right - left).max(1)) * scale_x).round().max(1.0) as u32;
-        let height = (f64::from((bottom - top).max(1)) * scale_y).round().max(1.0) as u32;
-        let max_width = state.capture_width.saturating_sub((x - state.origin_x).max(0) as u32).max(1);
-        let max_height = state.capture_height.saturating_sub((y - state.origin_y).max(0) as u32).max(1);
+        let width = (f64::from((right - left).max(1)) * scale_x)
+            .round()
+            .max(1.0) as u32;
+        let height = (f64::from((bottom - top).max(1)) * scale_y)
+            .round()
+            .max(1.0) as u32;
+        let max_width = state
+            .capture_width
+            .saturating_sub((x - state.origin_x).max(0) as u32)
+            .max(1);
+        let max_height = state
+            .capture_height
+            .saturating_sub((y - state.origin_y).max(0) as u32)
+            .max(1);
         CaptureRegionRect {
             x,
             y,
@@ -728,7 +1671,12 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         }
     }
 
-    unsafe extern "system" fn input_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn input_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AlphaSelectionState;
         match msg {
             WM_CREATE => {
@@ -805,7 +1753,12 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
         }
     }
 
-    unsafe extern "system" fn border_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn border_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
@@ -924,7 +1877,10 @@ fn native_select_region_alpha_window(cursor_x: Option<i32>, cursor_y: Option<i32
 }
 
 #[cfg(target_os = "windows")]
-fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
+fn native_select_region(
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
+) -> Result<NativeSelectionResult, String> {
     use std::{mem::zeroed, ptr::null_mut, time::Duration};
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
@@ -932,17 +1888,21 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
         SetROP2, HOLLOW_BRUSH, PS_SOLID, R2_NOTXORPEN,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_ESCAPE,
-    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, GetCursorPos, HHOOK, MSLLHOOKSTRUCT, PeekMessageW,
-        SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, MSG, PM_REMOVE, WH_MOUSE_LL,
+        CallNextHookEx, DispatchMessageW, GetCursorPos, PeekMessageW, SetWindowsHookExW,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, MSLLHOOKSTRUCT, PM_REMOVE, WH_MOUSE_LL,
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
     };
     const XOR_LINE_COLOR: u32 = 0x00ffffff;
 
-    unsafe fn draw_focus_rect(state: &mut NativeSelectionState, left: i32, top: i32, right: i32, bottom: i32) {
+    unsafe fn draw_focus_rect(
+        state: &mut NativeSelectionState,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    ) {
         if right <= left || bottom <= top {
             return;
         }
@@ -979,7 +1939,13 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
         let pen = CreatePen(PS_SOLID, 2, XOR_LINE_COLOR);
         let old_pen = SelectObject(hdc, pen as _);
         let old_brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-        Rectangle(hdc, state.drawn_left, state.drawn_top, state.drawn_right, state.drawn_bottom);
+        Rectangle(
+            hdc,
+            state.drawn_left,
+            state.drawn_top,
+            state.drawn_right,
+            state.drawn_bottom,
+        );
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         DeleteObject(pen as _);
@@ -988,7 +1954,10 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
         state.has_drawn = false;
     }
 
-    unsafe fn redraw_selection(state: &mut NativeSelectionState, context: &NativeSelectionHookContext) {
+    unsafe fn redraw_selection(
+        state: &mut NativeSelectionState,
+        context: &NativeSelectionHookContext,
+    ) {
         erase_focus_rect(state);
         if !state.dragging {
             return;
@@ -1000,7 +1969,10 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
         draw_focus_rect(state, left, top, right, bottom);
     }
 
-    unsafe fn update_cursor_selection(state: &mut NativeSelectionState, context: &NativeSelectionHookContext) {
+    unsafe fn update_cursor_selection(
+        state: &mut NativeSelectionState,
+        context: &NativeSelectionHookContext,
+    ) {
         if !state.dragging {
             return;
         }
@@ -1127,13 +2099,20 @@ fn native_select_region(cursor_x: Option<i32>, cursor_y: Option<i32>) -> Result<
 }
 
 #[cfg(not(target_os = "windows"))]
-fn native_select_region(_cursor_x: Option<i32>, _cursor_y: Option<i32>) -> Result<NativeSelectionResult, String> {
+fn native_select_region(
+    _cursor_x: Option<i32>,
+    _cursor_y: Option<i32>,
+) -> Result<NativeSelectionResult, String> {
     Err("Native live area selection is only available on Windows".to_string())
 }
 
 #[cfg(target_os = "windows")]
 fn snipping_tool_area_capture(quality_scale: f64) -> Result<CaptureResult, String> {
-    use std::{process::Command, thread, time::{Duration, Instant}};
+    use std::{
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
     use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
     let before = unsafe { GetClipboardSequenceNumber() };
@@ -1201,7 +2180,9 @@ async fn native_area_capture(
             0.0
         };
         if selection.delayed && delay > 0.0 {
-            std::thread::sleep(std::time::Duration::from_millis((delay * 1000.0).round() as u64));
+            std::thread::sleep(std::time::Duration::from_millis(
+                (delay * 1000.0).round() as u64
+            ));
         }
         finish_area_capture(selection.rect, quality_scale).await
     }
@@ -1210,10 +2191,12 @@ async fn native_area_capture(
         Ok(selection) => finish_selection(selection, quality_scale, delayed_capture_seconds).await,
         Err(error) if error == "Area capture canceled" => Err(error),
         Err(_) => match native_select_region(cursor_x, cursor_y) {
-            Ok(selection) => finish_selection(selection, quality_scale, delayed_capture_seconds).await,
+            Ok(selection) => {
+                finish_selection(selection, quality_scale, delayed_capture_seconds).await
+            }
             Err(error) if error == "Area capture canceled" => Err(error),
             Err(_) => snipping_tool_area_capture(quality_scale),
-        }
+        },
     }
 }
 
@@ -1235,8 +2218,8 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
             GWL_EXSTYLE, GWL_STYLE, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED,
-            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+            SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
         };
 
         let hwnd = window.hwnd().map_err(err)?.0 as windows_sys::Win32::Foundation::HWND;
@@ -1248,11 +2231,9 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
             // Tauri asks for a borderless overlay, but Windows can briefly
             // surface native chrome while a no-activate overlay is dragged.
             // Clear it explicitly before every capture session.
-            let chrome_bits = (WS_CAPTION
-                | WS_THICKFRAME
-                | WS_SYSMENU
-                | WS_MINIMIZEBOX
-                | WS_MAXIMIZEBOX) as isize;
+            let chrome_bits =
+                (WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+                    as isize;
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             SetWindowLongPtrW(hwnd, GWL_STYLE, style & !chrome_bits);
 
@@ -1260,7 +2241,10 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
             SetWindowLongPtrW(
                 hwnd,
                 GWL_EXSTYLE,
-                (ex_style | WS_EX_LAYERED as isize | WS_EX_TOOLWINDOW as isize | WS_EX_NOACTIVATE as isize)
+                (ex_style
+                    | WS_EX_LAYERED as isize
+                    | WS_EX_TOOLWINDOW as isize
+                    | WS_EX_NOACTIVATE as isize)
                     & !(WS_EX_APPWINDOW as isize),
             );
             SetWindowPos(
@@ -1300,7 +2284,10 @@ fn prepare_overlay_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn list_local_captures(app: AppHandle, limit: usize) -> Result<Vec<LocalCaptureRecord>, String> {
+async fn list_local_captures(
+    app: AppHandle,
+    limit: usize,
+) -> Result<Vec<LocalCaptureRecord>, String> {
     let root = local_captures_root(&app)?;
     let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
 
@@ -1363,7 +2350,12 @@ fn platform_label() -> String {
 }
 
 fn clean_context_text(value: String, max_len: usize) -> Option<String> {
-    let text = value.replace('\0', "").trim().chars().take(max_len).collect::<String>();
+    let text = value
+        .replace('\0', "")
+        .trim()
+        .chars()
+        .take(max_len)
+        .collect::<String>();
     if text.is_empty() {
         None
     } else {
@@ -1561,8 +2553,14 @@ pub fn run() {
             launched_hidden,
             reveal_in_folder,
             reveal_pending_capture,
+            local_captures_root_path,
             ensure_device_keypair,
             sign_challenge,
+            google_drive_status,
+            google_drive_link,
+            google_drive_unlink,
+            google_drive_upload_capture,
+            google_drive_update_capture_ocr,
             capture_monitor_previews,
             capture_display,
             begin_area_capture,

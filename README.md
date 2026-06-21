@@ -1,6 +1,6 @@
 # DendroCapture
 
-DendroCapture is a lightweight desktop screenshot companion built with Tauri, React, and Rust. It captures a PNG, copies it to the system clipboard, and stores the capture locally by default. When paired with Dendro Assets, it can also upload captures to DendroWebsite and open the uploaded image automatically.
+DendroCapture is a lightweight desktop screenshot companion built with Tauri, React, and Rust. It captures a PNG, copies it to the system clipboard, and stores the capture locally by default. When paired with Dendro Assets, it can also upload captures to DendroWebsite and optionally open the uploaded image.
 
 The public app is usable without a Dendro account: unpaired captures stay on the local machine and are never uploaded.
 
@@ -110,7 +110,11 @@ The server stores only the public key and issues short-lived capture JWTs after 
 5. `DendroAPI` forwards chunk/finalize work to the Mac mini worker through the existing HMAC-protected `MAC_HUB_URL` contract.
 6. The worker stores the PNG in the Dendro Assets storage root and returns storage keys, checksum, size, and image metadata.
 7. `DendroAPI` marks the new asset ready and returns a one-time browser handoff URL.
-8. DendroCapture opens that URL, and DendroWebsite opens the Dendro Assets `Captures` tab with the new capture selected.
+8. If `Open image online after upload` is enabled, DendroCapture opens that URL and DendroWebsite opens the Dendro Assets `Captures` tab with the new capture selected.
+
+## Release Verification
+
+Public Windows installers must be signed before distribution. See [docs/windows-and-oauth-verification.md](docs/windows-and-oauth-verification.md) for the Windows SmartScreen, browser download, and Google OAuth verification checklist.
 
 ## Capture Metadata
 

@@ -4,8 +4,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import { currentMonitor, cursorPosition, getCurrentWindow, LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { register, unregister, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
+import Tesseract from 'tesseract.js';
 import { AnnotationEditor, type AnnotationSavePayload } from './annotationEditor';
 import {
   Aperture,
@@ -27,6 +28,7 @@ import {
   RefreshCw,
   Settings,
   UploadCloud,
+  Users,
   ShieldCheck,
   X,
 } from 'lucide-react';
@@ -35,6 +37,9 @@ import './styles.css';
 type CaptureMode = 'area' | 'fullscreen';
 type AppTab = 'capture' | 'history' | 'queue' | 'settings';
 type ShortcutField = 'areaShortcut' | 'fullscreenShortcut';
+type CaptureDestination = 'local' | 'dendroApi' | 'googleDrive';
+type UploadDestination = 'dendroApi' | 'googleDrive';
+type SettingsSection = 'destination' | 'local' | 'dendroApi' | 'googleDrive' | 'capture';
 
 interface NativeCapture {
   pngBase64: string;
@@ -79,11 +84,16 @@ interface CaptureSettings {
   qualityScale: number;
   delayedAreaCaptureSeconds: number;
   deviceName: string;
+  captureDestination: CaptureDestination;
   apiSendingEnabled: boolean;
   openAfterUpload: boolean;
   hideDuringCapture: boolean;
   liveAreaSelection: boolean;
   saveLocally: boolean;
+  googleDriveUploadEnabled: boolean;
+  googleDriveOcrEnabled: boolean;
+  googleDriveClientId: string;
+  googleDriveClientSecret: string;
   launchOnStartup: boolean;
 }
 
@@ -99,7 +109,11 @@ interface PendingCapture {
   appName?: string;
   windowTitle?: string;
   previewBase64?: string;
+  destination?: UploadDestination;
   assetUrl?: string;
+  googleDriveFileId?: string;
+  googleDriveUrl?: string;
+  googleDriveFolderUrl?: string;
 }
 
 type UploadableCapture = PendingCapture & { pngBase64?: string };
@@ -119,6 +133,33 @@ interface EditingCapture {
 
 interface LocalCaptureSave {
   filePath: string;
+}
+
+interface GoogleDriveStatus {
+  configured: boolean;
+  linked: boolean;
+  hasClientSecret?: boolean;
+  clientId?: string | null;
+  email?: string | null;
+  folderId?: string | null;
+  folderName?: string | null;
+}
+
+interface GoogleDriveLinkResult {
+  email?: string | null;
+  folderId: string;
+  folderName: string;
+}
+
+interface GoogleDriveUploadResult {
+  fileId: string;
+  webViewLink?: string | null;
+  folderViewLink?: string | null;
+  ocrIndexed: boolean;
+}
+
+interface GoogleDriveOcrUpdateResult {
+  ocrIndexed: boolean;
 }
 
 interface CaptureWindowContext {
@@ -160,20 +201,26 @@ interface CaptureCancelPayload {
   restoreWindow?: boolean;
 }
 
-const APP_VERSION = '0.1.46';
+const APP_VERSION = '0.1.63';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
 const LOCAL_CAPTURES_KEY = 'dendro-capture:local-captures';
 const LIVE_SELECTION_DEFAULT_KEY = 'dendro-capture:live-selection-default-v1';
+const OPEN_AFTER_UPLOAD_DEFAULT_OFF_KEY = 'dendro-capture:open-after-upload-default-off-v1';
 const SIDEBAR_KEY = 'dendro-capture:sidebar-collapsed';
 const CHUNK_SIZE = 8 * 1024 * 1024;
-const MIN_APP_WIDTH = 740;
-const MIN_APP_HEIGHT = 440;
-const MAX_APP_WIDTH = 980;
-const MAX_APP_HEIGHT = 640;
+const MIN_APP_WIDTH = 820;
+const MIN_APP_HEIGHT = 500;
+const MAX_APP_WIDTH = 1120;
+const MAX_APP_HEIGHT = 720;
 const DEFAULT_AREA_SHORTCUT = 'Ctrl+Alt+C';
 const OLD_DEFAULT_AREA_SHORTCUT = 'Alt+Shift+4';
+const GOOGLE_DRIVE_API_CONSOLE_URL = 'https://console.cloud.google.com/apis/library/drive.googleapis.com';
+const GOOGLE_AUTH_CLIENTS_URL = 'https://console.cloud.google.com/auth/clients';
+const GOOGLE_AUTH_AUDIENCE_URL = 'https://console.cloud.google.com/auth/audience';
+const GOOGLE_CREDENTIALS_DOCS_URL = 'https://developers.google.com/workspace/guides/create-credentials';
+const DENDRO_STUDIOS_CAPTURES_URL = 'https://dendrostudios.com/admin/?tab=toolkit&tool=captures';
 
 const defaultSettings: CaptureSettings = {
   apiBaseUrl: 'http://localhost:3001/api',
@@ -182,11 +229,16 @@ const defaultSettings: CaptureSettings = {
   qualityScale: 1,
   delayedAreaCaptureSeconds: 2,
   deviceName: 'DendroCapture Desktop',
+  captureDestination: 'local',
   apiSendingEnabled: true,
-  openAfterUpload: true,
+  openAfterUpload: false,
   hideDuringCapture: true,
   liveAreaSelection: true,
   saveLocally: true,
+  googleDriveUploadEnabled: false,
+  googleDriveOcrEnabled: true,
+  googleDriveClientId: '',
+  googleDriveClientSecret: '',
   launchOnStartup: true,
 };
 
@@ -266,7 +318,18 @@ const loadSettings = (): CaptureSettings => {
   const liveAreaSelection = typeof raw.liveAreaSelection === 'boolean'
     ? (liveSelectionDefaultApplied ? raw.liveAreaSelection : true)
     : defaultSettings.liveAreaSelection;
+  const openAfterUploadDefaultOffApplied = localStorage.getItem(OPEN_AFTER_UPLOAD_DEFAULT_OFF_KEY) === '1';
+  const openAfterUpload = openAfterUploadDefaultOffApplied
+    ? bool(raw.openAfterUpload, defaultSettings.openAfterUpload)
+    : false;
+  const rawDestination = typeof raw.captureDestination === 'string' ? raw.captureDestination : '';
+  const captureDestination: CaptureDestination = rawDestination === 'dendroApi' || rawDestination === 'googleDrive' || rawDestination === 'local'
+    ? rawDestination
+    : raw.googleDriveUploadEnabled === true
+      ? 'googleDrive'
+      : defaultSettings.captureDestination;
   if (!liveSelectionDefaultApplied) localStorage.setItem(LIVE_SELECTION_DEFAULT_KEY, '1');
+  if (!openAfterUploadDefaultOffApplied) localStorage.setItem(OPEN_AFTER_UPLOAD_DEFAULT_OFF_KEY, '1');
   const settings: CaptureSettings = {
     apiBaseUrl: str(raw.apiBaseUrl, defaultSettings.apiBaseUrl),
     areaShortcut: str(raw.areaShortcut, defaultSettings.areaShortcut),
@@ -274,11 +337,16 @@ const loadSettings = (): CaptureSettings => {
     qualityScale,
     delayedAreaCaptureSeconds,
     deviceName: str(raw.deviceName, defaultSettings.deviceName),
+    captureDestination,
     apiSendingEnabled: bool(raw.apiSendingEnabled, defaultSettings.apiSendingEnabled),
-    openAfterUpload: bool(raw.openAfterUpload, defaultSettings.openAfterUpload),
+    openAfterUpload,
     hideDuringCapture: bool(raw.hideDuringCapture, defaultSettings.hideDuringCapture),
     liveAreaSelection,
     saveLocally: bool(raw.saveLocally, defaultSettings.saveLocally),
+    googleDriveUploadEnabled: bool(raw.googleDriveUploadEnabled, defaultSettings.googleDriveUploadEnabled),
+    googleDriveOcrEnabled: bool(raw.googleDriveOcrEnabled, defaultSettings.googleDriveOcrEnabled),
+    googleDriveClientId: str(raw.googleDriveClientId, defaultSettings.googleDriveClientId),
+    googleDriveClientSecret: str(raw.googleDriveClientSecret, defaultSettings.googleDriveClientSecret),
     launchOnStartup: bool(raw.launchOnStartup, defaultSettings.launchOnStartup),
   };
   return {
@@ -303,6 +371,32 @@ const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
 };
 
 const dataUrl = (base64: string): string => `data:image/png;base64,${base64}`;
+
+let ocrWorkerPromise: ReturnType<typeof Tesseract.createWorker> | null = null;
+
+const getOcrWorker = () => {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = Tesseract
+      .createWorker('eng+fra', undefined, {
+        workerPath: '/ocr/worker.min.js',
+        corePath: '/ocr/core',
+        langPath: '/ocr/tessdata/',
+        workerBlobURL: false,
+        gzip: true,
+      })
+      .catch((error) => {
+        ocrWorkerPromise = null;
+        throw error;
+      }) as ReturnType<typeof Tesseract.createWorker>;
+  }
+  return ocrWorkerPromise;
+};
+
+const recognizeCaptureText = async (pngBase64: string): Promise<string> => {
+  const worker = await getOcrWorker();
+  const result = await worker.recognize(dataUrl(pngBase64));
+  return result.data.text.replace(/\0/g, ' ').trim();
+};
 
 const capturePreviewBase64 = (base64: string, maxWidth = 420): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -331,6 +425,7 @@ const loadPendingQueue = (): PendingCapture[] =>
     .filter((item) => typeof item.id === 'string' && typeof item.mode === 'string' && !item.pngBase64)
     .map((item) => {
       const mode: CaptureMode = item.mode === 'fullscreen' ? 'fullscreen' : 'area';
+      const destination: UploadDestination = item.destination === 'googleDrive' ? 'googleDrive' : 'dendroApi';
       return {
         id: String(item.id),
         mode,
@@ -345,7 +440,11 @@ const loadPendingQueue = (): PendingCapture[] =>
         previewBase64: typeof item.previewBase64 === 'string' && item.previewBase64.length < 300_000
           ? item.previewBase64
           : undefined,
+        destination,
         assetUrl: typeof item.assetUrl === 'string' ? item.assetUrl : undefined,
+        googleDriveFileId: typeof item.googleDriveFileId === 'string' ? item.googleDriveFileId : undefined,
+        googleDriveUrl: typeof item.googleDriveUrl === 'string' ? item.googleDriveUrl : undefined,
+        googleDriveFolderUrl: typeof item.googleDriveFolderUrl === 'string' ? item.googleDriveFolderUrl : undefined,
       };
     })
     .slice(0, 20);
@@ -414,8 +513,47 @@ const shortcutFromKeyboardEvent = (event: KeyboardEvent): string | null => {
   return [...parts, key].join('+');
 };
 
-const captureFileName = (date: Date): string =>
-  `dendro-capture-${date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}.png`;
+type CaptureFileSource = {
+  mode?: CaptureMode;
+  appName?: string | null;
+  windowTitle?: string | null;
+  width?: number | null;
+  height?: number | null;
+};
+
+const slugForFileName = (value?: string | null, fallback = 'capture'): string => {
+  const slug = (value || fallback)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 56)
+    .replace(/-+$/g, '');
+  return slug || fallback;
+};
+
+const captureFileName = (date: Date, source?: CaptureFileSource): string => {
+  const validDate = Number.isFinite(date.getTime()) ? date : new Date();
+  const timestamp = [
+    validDate.getHours(),
+    validDate.getMinutes(),
+    validDate.getSeconds(),
+  ].map((value) => String(value).padStart(2, '0')).join('');
+  const dimensions = source?.width && source?.height ? `${source.width}x${source.height}` : '';
+  const fallback = dimensions || (source?.mode === 'fullscreen' ? 'fullscreen' : source?.mode === 'area' ? 'area' : 'capture');
+  const sourceName = slugForFileName(source?.appName, fallback);
+  return `dendrocapture-${sourceName}-${timestamp}.png`;
+};
+
+const captureDayFolderName = (date: Date): string => {
+  const validDate = Number.isFinite(date.getTime()) ? date : new Date();
+  const year = validDate.getFullYear();
+  const month = String(validDate.getMonth() + 1).padStart(2, '0');
+  const day = String(validDate.getDate()).padStart(2, '0');
+  return `dendrocapture-${year}-${month}-${day}`;
+};
 
 const captureId = (date = new Date()): string =>
   `${date.getTime()}-${Math.random().toString(36).slice(2)}`;
@@ -463,6 +601,44 @@ const captureTitle = (capture: Pick<PendingCapture, 'mode' | 'capturedAt' | 'app
     minute: '2-digit',
   });
   return `${source} - ${stamp}`;
+};
+
+const captureDestinationLabel = (destination: CaptureDestination): string => {
+  switch (destination) {
+    case 'dendroApi':
+      return 'Dendro API';
+    case 'googleDrive':
+      return 'Google Drive';
+    default:
+      return 'Local';
+  }
+};
+
+const onlineImageUrl = (capture?: Pick<PendingCapture, 'assetUrl' | 'googleDriveUrl' | 'googleDriveFolderUrl'> | null): string | undefined =>
+  capture?.assetUrl || capture?.googleDriveUrl || capture?.googleDriveFolderUrl || undefined;
+
+const googleDriveFolderUrl = (folderId?: string | null): string | undefined =>
+  folderId ? `https://drive.google.com/drive/u/0/folders/${encodeURIComponent(folderId)}` : undefined;
+
+const dendroCapturesUrl = (apiBaseUrl: string): string | undefined => {
+  try {
+    const url = new URL(apiBaseUrl.trim());
+    if (url.hostname === 'dendrostudios.com' || url.hostname.endsWith('.dendrostudios.com')) {
+      return DENDRO_STUDIOS_CAPTURES_URL;
+    }
+    url.search = '';
+    url.hash = '';
+    if (url.hostname.startsWith('api.')) {
+      url.hostname = url.hostname.slice(4);
+    }
+    const segments = url.pathname.split('/').filter(Boolean);
+    const apiIndex = segments.lastIndexOf('api');
+    const baseSegments = apiIndex >= 0 ? segments.slice(0, apiIndex) : [];
+    url.pathname = `/${[...baseSegments, 'captures'].join('/')}`;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 };
 
 const tabTitle = (tab: AppTab): string => {
@@ -737,11 +913,16 @@ class BootErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 const DendroCaptureApp = () => {
   const [settings, setSettings] = useState<CaptureSettings>(loadSettings);
   const [device, setDevice] = useState<DeviceState | null>(loadDeviceState);
+  const [googleDrive, setGoogleDrive] = useState<GoogleDriveStatus>({
+    configured: false,
+    linked: false,
+  });
   const [pending, setPending] = useState<PendingCapture[]>(loadPendingQueue);
   // History is restored from the local-captures folder on boot (see the
   // list_local_captures effect below) and updated in memory afterwards.
   const [localCaptures, setLocalCaptures] = useState<LocalCapture[]>([]);
   const [tab, setTab] = useState<AppTab>('capture');
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('destination');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadJson(SIDEBAR_KEY, false));
   const [pairingCode, setPairingCode] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
@@ -758,6 +939,7 @@ const DendroCaptureApp = () => {
   } | null>(null);
   const settingsRef = useRef(settings);
   const deviceRef = useRef(device);
+  const googleDriveRef = useRef(googleDrive);
   const busyRef = useRef<string | null>(busy);
   const fitWindowTimerRef = useRef<number | null>(null);
   const areaSessionRef = useRef<{ captureId: string; session: AreaCaptureSession } | null>(null);
@@ -768,6 +950,7 @@ const DendroCaptureApp = () => {
   const mainWasVisibleRef = useRef(false);
   const shortcutOpsRef = useRef<Promise<void>>(Promise.resolve());
   const editingCaptureRef = useRef(false);
+  const googleDriveLinkAttemptRef = useRef(0);
   const activeCaptureContextRef = useRef<CaptureWindowContext | null>(null);
   const lastExternalContextRef = useRef<CaptureWindowContext | null>(null);
   const processCaptureRef = useRef<(
@@ -796,8 +979,8 @@ const DendroCaptureApp = () => {
     const scaleFactor = monitor?.scaleFactor || 1;
     const workWidth = monitor ? monitor.workArea.size.width / scaleFactor : 1440;
     const workHeight = monitor ? monitor.workArea.size.height / scaleFactor : 900;
-    const width = Math.round(clampNumber(Math.min(workWidth - 32, workWidth * 0.52), MIN_APP_WIDTH, MAX_APP_WIDTH));
-    const height = Math.round(clampNumber(Math.min(workHeight - 32, workHeight * 0.62), MIN_APP_HEIGHT, MAX_APP_HEIGHT));
+    const width = Math.round(clampNumber(Math.min(workWidth - 32, workWidth * 0.62), MIN_APP_WIDTH, MAX_APP_WIDTH));
+    const height = Math.round(clampNumber(Math.min(workHeight - 32, workHeight * 0.68), MIN_APP_HEIGHT, MAX_APP_HEIGHT));
     await win.setResizable(false).catch(() => undefined);
     await win.setSize(new LogicalSize(width, height)).catch(() => undefined);
   }, []);
@@ -893,6 +1076,10 @@ const DendroCaptureApp = () => {
   }, [settings]);
 
   useEffect(() => {
+    googleDriveRef.current = googleDrive;
+  }, [googleDrive]);
+
+  useEffect(() => {
     deviceRef.current = device;
     if (hasPairedDevice(device)) saveJson(DEVICE_KEY, device);
     else localStorage.removeItem(DEVICE_KEY);
@@ -935,6 +1122,9 @@ const DendroCaptureApp = () => {
               windowTitle: typeof meta.windowTitle === 'string' ? meta.windowTitle : undefined,
               previewBase64: typeof meta.previewBase64 === 'string' ? meta.previewBase64 : undefined,
               assetUrl: typeof meta.assetUrl === 'string' ? meta.assetUrl : undefined,
+              googleDriveFileId: typeof meta.googleDriveFileId === 'string' ? meta.googleDriveFileId : undefined,
+              googleDriveUrl: typeof meta.googleDriveUrl === 'string' ? meta.googleDriveUrl : undefined,
+              googleDriveFolderUrl: typeof meta.googleDriveFolderUrl === 'string' ? meta.googleDriveFolderUrl : undefined,
               filePath: record.filePath,
             });
           } catch {
@@ -964,8 +1154,123 @@ const DendroCaptureApp = () => {
       .catch((error) => console.warn('Could not update launch on startup', error));
   }, [settings.launchOnStartup]);
 
+  const refreshGoogleDriveStatus = useCallback(async () => {
+    try {
+      const status = await invoke<GoogleDriveStatus>('google_drive_status', {
+        clientId: settingsRef.current.googleDriveClientId.trim() || null,
+        clientSecret: settingsRef.current.googleDriveClientSecret.trim() || null,
+      });
+      setGoogleDrive(status);
+      if (status.clientId && !settingsRef.current.googleDriveClientId.trim()) {
+        setSettings((current) => current.googleDriveClientId.trim()
+          ? current
+          : { ...current, googleDriveClientId: status.clientId || '' });
+      }
+      return status;
+    } catch (error) {
+      console.warn('Could not read Google Drive status', error);
+      const fallback = { configured: false, linked: false } satisfies GoogleDriveStatus;
+      setGoogleDrive(fallback);
+      return fallback;
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshGoogleDriveStatus();
+  }, [refreshGoogleDriveStatus, settings.googleDriveClientId, settings.googleDriveClientSecret]);
+
   const updateSettings = (patch: Partial<CaptureSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
+  };
+
+  const selectCaptureDestination = (destination: CaptureDestination) => {
+    setSettingsSection(destination);
+    setSettings((current) => ({
+      ...current,
+      captureDestination: destination,
+      saveLocally: destination === 'local' ? true : current.saveLocally,
+      apiSendingEnabled: destination === 'dendroApi' ? true : current.apiSendingEnabled,
+      googleDriveUploadEnabled: destination === 'googleDrive',
+    }));
+    if (destination === 'googleDrive' && (!settingsRef.current.googleDriveClientId.trim() || !settingsRef.current.googleDriveClientSecret.trim())) {
+      setStatus('Google Drive selected. Paste the OAuth desktop Client ID and Client Secret to link it.');
+    } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
+      setStatus('Google Drive selected. Link your account before captures upload there.');
+    } else {
+      setStatus(`Capture destination set to ${destination === 'local' ? 'Local' : destination === 'dendroApi' ? 'Dendro API' : 'Google Drive'}`);
+    }
+  };
+
+  const linkGoogleDrive = async () => {
+    if (busyRef.current && busyRef.current !== 'google-drive-link') return;
+    const clientId = settingsRef.current.googleDriveClientId.trim();
+    const clientSecret = settingsRef.current.googleDriveClientSecret.trim();
+    if (!clientId) {
+      setStatus('Paste a Google OAuth desktop client ID first');
+      return;
+    }
+    if (!clientSecret) {
+      setStatus('Paste the Google OAuth desktop client secret too');
+      return;
+    }
+    if (!clientId.endsWith('.apps.googleusercontent.com')) {
+      setStatus('Paste the OAuth Client ID, not the Client Secret. The Client ID usually ends with .apps.googleusercontent.com');
+      return;
+    }
+    if (clientSecret.endsWith('.apps.googleusercontent.com')) {
+      setStatus('Paste the OAuth Client Secret in the secret field, not another Client ID');
+      return;
+    }
+    const attemptId = googleDriveLinkAttemptRef.current + 1;
+    googleDriveLinkAttemptRef.current = attemptId;
+    busyRef.current = 'google-drive-link';
+    setBusy('google-drive-link');
+    setStatus('Opening Google Drive link flow. If Google shows an error, correct the client ID or secret and click Link again.');
+    try {
+      const linked = await withTimeout(
+        invoke<GoogleDriveLinkResult>('google_drive_link', { clientId, clientSecret }),
+        90_000,
+        'Google did not return to DendroCapture. Check the client ID and secret, then click Link Google Drive again.',
+      );
+      if (googleDriveLinkAttemptRef.current !== attemptId) return;
+      setGoogleDrive({
+        configured: true,
+        linked: true,
+        clientId,
+        email: linked.email,
+        folderId: linked.folderId,
+        folderName: linked.folderName,
+      });
+      updateSettings({ captureDestination: 'googleDrive', googleDriveUploadEnabled: true });
+      setStatus('Google Drive linked');
+    } catch (error) {
+      if (googleDriveLinkAttemptRef.current !== attemptId) return;
+      setStatus(errorMessage(error, 'Could not link Google Drive'));
+      await refreshGoogleDriveStatus();
+    } finally {
+      if (googleDriveLinkAttemptRef.current === attemptId) {
+        busyRef.current = null;
+        setBusy(null);
+      }
+    }
+  };
+
+  const unlinkGoogleDrive = async () => {
+    if (busyRef.current) return;
+    busyRef.current = 'google-drive-unlink';
+    setBusy('google-drive-unlink');
+    setStatus('Unlinking Google Drive');
+    try {
+      await invoke('google_drive_unlink');
+      updateSettings({ googleDriveUploadEnabled: false, captureDestination: 'local' });
+      await refreshGoogleDriveStatus();
+      setStatus('Google Drive unlinked');
+    } catch (error) {
+      setStatus(errorMessage(error, 'Could not unlink Google Drive'));
+    } finally {
+      busyRef.current = null;
+      setBusy(null);
+    }
   };
 
   const readActiveWindowContext = useCallback(async (): Promise<CaptureWindowContext | null> => {
@@ -1095,12 +1400,32 @@ const DendroCaptureApp = () => {
     return token.accessToken;
   };
 
+  const queueDestination = (capture: Pick<PendingCapture, 'destination'>): UploadDestination =>
+    capture.destination === 'googleDrive' ? 'googleDrive' : 'dendroApi';
+
+  const queueDestinationLabel = (capture: Pick<PendingCapture, 'destination'>): string =>
+    queueDestination(capture) === 'googleDrive' ? 'Google Drive' : 'Dendro API';
+
   const addPending = (capture: PendingCapture) => {
-    setPending((current) => [capture, ...current.filter((item) => item.id !== capture.id)].slice(0, 20));
+    const destination = queueDestination(capture);
+    const queued = { ...capture, destination };
+    setPending((current) => [
+      queued,
+      ...current.filter((item) => item.id !== queued.id || queueDestination(item) !== destination),
+    ].slice(0, 20));
   };
 
-  const removePending = (id: string) => {
-    setPending((current) => current.filter((item) => item.id !== id));
+  const removePending = (id: string, destination?: UploadDestination) => {
+    setPending((current) => {
+      const next = current.filter((item) => {
+        if (item.id !== id) return true;
+        return destination ? queueDestination(item) !== destination : false;
+      });
+      if (!next.some((item) => item.id === id)) {
+        void invoke('delete_pending_capture', { id }).catch(() => undefined);
+      }
+      return next;
+    });
   };
 
   const revealCapture = async (item: LocalCapture) => {
@@ -1177,8 +1502,8 @@ const DendroCaptureApp = () => {
       filePath: replace ? base.filePath : undefined,
     };
     const sourceName = replace && base.filePath
-      ? base.filePath.split(/[\\/]/).pop() || captureFileName(targetDate)
-      : captureFileName(targetDate);
+      ? base.filePath.split(/[\\/]/).pop() || captureFileName(targetDate, target)
+      : captureFileName(targetDate, target);
 
     await invoke('copy_png_to_clipboard', { pngBase64 }).catch((error) => {
       console.warn('Could not copy edited capture to clipboard', error);
@@ -1186,8 +1511,9 @@ const DendroCaptureApp = () => {
     setLastCapture(target);
     setLastCaptureImage(pngBase64);
 
-    if (hasPairedDevice(deviceRef.current) && settingsRef.current.apiSendingEnabled) {
-      const uploadItem: PendingCapture = { ...target };
+    const destination = settingsRef.current.captureDestination;
+    if (destination === 'dendroApi' && hasPairedDevice(deviceRef.current) && settingsRef.current.apiSendingEnabled) {
+      const uploadItem: PendingCapture = { ...target, destination: 'dendroApi' };
       let queuedForRetry = false;
       if (settingsRef.current.saveLocally) {
         await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
@@ -1210,6 +1536,37 @@ const DendroCaptureApp = () => {
         setStatus(queuedForRetry
           ? `Edited capture queued: ${errorMessage(error, 'Upload failed')}`
           : `Edited capture upload failed: ${errorMessage(error, 'Upload failed')}`);
+      }
+      return;
+    }
+
+    if (destination === 'googleDrive' && googleDriveCanUpload()) {
+      const uploadItem: PendingCapture = { ...target, destination: 'googleDrive' };
+      let queuedForRetry = false;
+      if (settingsRef.current.saveLocally) {
+        await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
+          console.warn('Could not persist edited Google Drive pending capture', error);
+        });
+        addPending(uploadItem);
+        queuedForRetry = true;
+      }
+      setEditingCapture(null);
+      setStatus('Uploading edited capture to Google Drive');
+      try {
+        const uploaded = await uploadCaptureToGoogleDrive({ ...uploadItem, pngBase64 });
+        const uploadedItem = {
+          ...uploadItem,
+          googleDriveFileId: uploaded.fileId,
+          googleDriveUrl: uploaded.webViewLink || undefined,
+          googleDriveFolderUrl: uploaded.folderViewLink || undefined,
+        };
+        setLastCapture(uploadedItem);
+        updateCaptureRecord(uploadedItem);
+        setStatus('Edited capture uploaded to Google Drive');
+      } catch (error) {
+        setStatus(queuedForRetry
+          ? `Edited capture queued for Google Drive: ${errorMessage(error, 'Upload failed')}`
+          : `Edited Google Drive upload failed: ${errorMessage(error, 'Upload failed')}`);
       }
       return;
     }
@@ -1263,7 +1620,7 @@ const DendroCaptureApp = () => {
     );
     const bytes = base64ToBytes(pngBase64);
     const platform = await platformLabel();
-    const sourceName = captureFileName(new Date(capture.capturedAt));
+    const sourceName = captureFileName(new Date(capture.capturedAt), capture);
     const appName = capture.appName?.trim();
     const windowTitle = capture.windowTitle?.trim();
     const displayName = appName || windowTitle || 'Desktop';
@@ -1323,18 +1680,108 @@ const DendroCaptureApp = () => {
         sha256,
       }, token)
     );
-    removePending(capture.id);
-    await invoke('delete_pending_capture', { id: capture.id }).catch(() => undefined);
+    removePending(capture.id, 'dendroApi');
     if (finalized.openUrl && settingsRef.current.openAfterUpload) {
-      await openUrl(finalized.openUrl);
+      await openOnlineImage(finalized.openUrl);
     }
     return finalized;
+  };
+
+  const openOnlineImage = async (url?: string | null): Promise<void> => {
+    if (!url || !settingsRef.current.openAfterUpload) return;
+    try {
+      await openUrl(url);
+    } catch (error) {
+      console.warn('Could not open online image after upload', error);
+      setStatus(`Uploaded, but could not open online image: ${errorMessage(error, 'Open failed')}`);
+    }
+  };
+
+  const googleDriveCanUpload = (): boolean => {
+    const drive = googleDriveRef.current;
+    return settingsRef.current.captureDestination === 'googleDrive' && settingsRef.current.googleDriveUploadEnabled && drive.configured && drive.linked;
+  };
+
+  const updateGoogleDriveOcrMetadata = async (
+    capture: UploadableCapture,
+    pngBase64: string,
+    fileId: string,
+  ): Promise<void> => {
+    if (!settingsRef.current.googleDriveOcrEnabled) return;
+    try {
+      setStatus('Google Drive upload complete, OCR running in background');
+      const ocrText = await recognizeCaptureText(pngBase64);
+      if (!ocrText) {
+        setStatus('Google Drive upload complete, OCR found no text');
+        return;
+      }
+      const result = await invoke<GoogleDriveOcrUpdateResult>('google_drive_update_capture_ocr', {
+        payload: {
+          fileId,
+          captureId: capture.id,
+          capturedAt: capture.capturedAt,
+          mode: capture.mode,
+          width: capture.width,
+          height: capture.height,
+          displayWidth: capture.displayWidth,
+          displayHeight: capture.displayHeight,
+          scaleFactor: capture.scaleFactor,
+          appName: capture.appName,
+          windowTitle: capture.windowTitle,
+          ocrText,
+        },
+      });
+      setStatus(result.ocrIndexed
+        ? 'Google Drive OCR metadata updated'
+        : 'Google Drive upload complete, OCR found no text');
+    } catch (error) {
+      console.warn('Google Drive background OCR failed', error);
+      setStatus(`Google Drive upload complete, OCR skipped: ${errorMessage(error, 'OCR failed')}`);
+    }
+  };
+
+  const uploadCaptureToGoogleDrive = async (
+    capture: UploadableCapture,
+  ): Promise<GoogleDriveUploadResult> => {
+    if (!settingsRef.current.googleDriveUploadEnabled) {
+      throw new Error('Google Drive is not selected as the capture destination');
+    }
+    const drive = googleDriveRef.current;
+    if (!drive.configured) {
+      throw new Error('Paste a Google OAuth desktop Client ID and Client Secret in Google Drive settings first');
+    }
+    if (!drive.linked) {
+      throw new Error('Link Google Drive before uploading captures');
+    }
+
+    const pngBase64 = capture.pngBase64 || await invoke<string>('read_pending_capture', { id: capture.id });
+    setStatus('Uploading capture to Google Drive');
+    const result = await invoke<GoogleDriveUploadResult>('google_drive_upload_capture', {
+      payload: {
+        filename: captureFileName(new Date(capture.capturedAt), capture),
+        dayFolderName: captureDayFolderName(new Date(capture.capturedAt)),
+        pngBase64,
+        captureId: capture.id,
+        capturedAt: capture.capturedAt,
+        mode: capture.mode,
+        width: capture.width,
+        height: capture.height,
+        displayWidth: capture.displayWidth,
+        displayHeight: capture.displayHeight,
+        scaleFactor: capture.scaleFactor,
+        appName: capture.appName,
+        windowTitle: capture.windowTitle,
+      },
+    });
+    removePending(capture.id, 'googleDrive');
+    await openOnlineImage(result.webViewLink || result.folderViewLink);
+    void updateGoogleDriveOcrMetadata(capture, pngBase64, result.fileId);
+    return result;
   };
 
   const processCapture = async (mode: CaptureMode, capture: NativeCapture, context?: CaptureWindowContext | null) => {
     const now = new Date();
     const cleanContext = cleanCaptureContext(context);
-    const sourceName = captureFileName(now);
     const item: PendingCapture = {
       id: captureId(now),
       mode,
@@ -1347,6 +1794,7 @@ const DendroCaptureApp = () => {
       appName: cleanContext?.appName || undefined,
       windowTitle: cleanContext?.windowTitle || undefined,
     };
+    const sourceName = captureFileName(now, item);
     try {
       await invoke('copy_png_to_clipboard', { pngBase64: capture.pngBase64 });
       setStatus('Copied PNG to clipboard');
@@ -1362,15 +1810,16 @@ const DendroCaptureApp = () => {
     };
     setLastCapture(queuedItem);
 
+    const destination = settingsRef.current.captureDestination;
     const pairedForUpload = hasPairedDevice(deviceRef.current);
-    const canSendToApi = pairedForUpload && settingsRef.current.apiSendingEnabled;
-    const shouldSaveLocally = settingsRef.current.saveLocally;
+    const canSendToApi = destination === 'dendroApi' && pairedForUpload && settingsRef.current.apiSendingEnabled;
+    const canSendToDrive = googleDriveCanUpload();
+    const shouldSaveLocally = destination === 'local' || settingsRef.current.saveLocally;
+    let workingItem: LocalCapture = queuedItem;
+    let localSaveError: string | null = null;
+    let localSaved = false;
 
-    if (!canSendToApi) {
-      if (!shouldSaveLocally) {
-        setStatus(pairedForUpload ? 'Copied PNG, API sending blocked' : 'Copied PNG to clipboard');
-        return;
-      }
+    if (shouldSaveLocally) {
       try {
         const saved = await invoke<LocalCaptureSave>('save_local_capture', {
           filename: sourceName,
@@ -1381,43 +1830,95 @@ const DendroCaptureApp = () => {
             appVersion: APP_VERSION,
           }),
         });
-        const savedCapture = { ...queuedItem, filePath: saved.filePath };
-        addLocalCapture(savedCapture);
-        setLastCapture(savedCapture);
-        setStatus(pairedForUpload ? 'Saved locally, API sending blocked' : 'Saved locally');
+        workingItem = { ...queuedItem, filePath: saved.filePath };
+        addLocalCapture(workingItem);
+        setLastCapture(workingItem);
+        localSaved = true;
       } catch (error) {
-        addLocalCapture(queuedItem);
-        setStatus(`Copied PNG, local save failed: ${errorMessage(error, 'Unknown error')}`);
+        localSaveError = errorMessage(error, 'Unknown error');
+        console.warn('Could not save capture locally', error);
+      }
+    }
+
+    if (!canSendToApi && !canSendToDrive) {
+      if (localSaveError) {
+        setStatus(`Copied PNG, local save failed: ${localSaveError}`);
+      } else if (localSaved) {
+        setStatus(destination === 'dendroApi' && pairedForUpload && !settingsRef.current.apiSendingEnabled ? 'Saved locally, API sending blocked' : 'Saved locally');
+      } else if (destination === 'dendroApi' && !pairedForUpload) {
+        setStatus('Copied PNG. Pair DendroCapture before uploading to Dendro API.');
+      } else if (destination === 'dendroApi' && !settingsRef.current.apiSendingEnabled) {
+        setStatus('Copied PNG, API sending blocked');
+      } else if (destination === 'googleDrive' && (!settingsRef.current.googleDriveClientId.trim() || !settingsRef.current.googleDriveClientSecret.trim())) {
+        setStatus('Copied PNG. Paste a Google OAuth Client ID and Client Secret to enable Google Drive.');
+      } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
+        setStatus('Copied PNG. Link Google Drive before captures upload there.');
+      } else {
+        setStatus('Copied PNG to clipboard');
       }
       return;
     }
 
-    let queuedForRetry = false;
-    if (shouldSaveLocally) {
+    const persistRetryCapture = async (uploadItem: PendingCapture): Promise<boolean> => {
+      if (!shouldSaveLocally) return false;
       try {
-        await invoke('save_pending_capture', { id: queuedItem.id, pngBase64: capture.pngBase64 });
-        addPending(queuedItem);
-        queuedForRetry = true;
+        await invoke('save_pending_capture', { id: uploadItem.id, pngBase64: capture.pngBase64 });
+        addPending(uploadItem);
+        return true;
       } catch (error) {
-        console.warn('Could not persist pending capture', error);
+        console.warn(`Could not persist ${queueDestinationLabel(uploadItem)} pending capture`, error);
+        return false;
+      }
+    };
+
+    const outcomes: string[] = [];
+    const warnings: string[] = [];
+
+    if (canSendToApi) {
+      const apiItem: PendingCapture = { ...workingItem, destination: 'dendroApi' };
+      const queuedForRetry = await persistRetryCapture(apiItem);
+      setStatus('Uploading capture to Dendro API');
+      try {
+        const uploaded = await uploadCapture({ ...apiItem, pngBase64: capture.pngBase64 });
+        if (uploaded.openUrl) {
+          const uploadedItem = { ...workingItem, assetUrl: uploaded.openUrl };
+          workingItem = uploadedItem;
+          setLastCapture(uploadedItem);
+          updateCaptureRecord(uploadedItem);
+        }
+        outcomes.push('uploaded to Dendro API');
+      } catch (error) {
+        outcomes.push(queuedForRetry ? 'queued for Dendro API' : `Dendro API failed: ${errorMessage(error, 'Upload failed')}`);
       }
     }
-    setStatus('Uploading capture');
-    try {
-      const uploaded = await uploadCapture({ ...queuedItem, pngBase64: capture.pngBase64 });
-      if (uploaded.openUrl) {
-        const uploadedItem = { ...queuedItem, assetUrl: uploaded.openUrl };
+
+    if (canSendToDrive) {
+      const driveItem: PendingCapture = { ...workingItem, destination: 'googleDrive' };
+      const queuedForRetry = await persistRetryCapture(driveItem);
+      try {
+        const uploaded = await uploadCaptureToGoogleDrive({ ...driveItem, pngBase64: capture.pngBase64 });
+        const uploadedItem = {
+          ...workingItem,
+          googleDriveFileId: uploaded.fileId,
+          googleDriveUrl: uploaded.webViewLink || undefined,
+          googleDriveFolderUrl: uploaded.folderViewLink || undefined,
+        };
+        workingItem = uploadedItem;
         setLastCapture(uploadedItem);
         updateCaptureRecord(uploadedItem);
-      }
-      setStatus('Capture uploaded');
-    } catch (error) {
-      if (queuedForRetry) {
-        setStatus(`Queued: ${errorMessage(error, 'Upload failed')}`);
-      } else {
-        setStatus(`Copied PNG, upload failed: ${errorMessage(error, 'Upload failed')}`);
+        outcomes.push('uploaded to Google Drive');
+      } catch (error) {
+        outcomes.push(queuedForRetry ? 'queued for Google Drive' : `Google Drive failed: ${errorMessage(error, 'Upload failed')}`);
       }
     }
+
+    const localPrefix = localSaveError
+      ? `Local save failed: ${localSaveError}. `
+      : localSaved
+        ? 'Saved locally, '
+        : '';
+    const suffix = warnings.length ? ` (${warnings.join('; ')})` : '';
+    setStatus(`${localPrefix}${outcomes.length ? outcomes.join(', ') : 'capture ready'}${suffix}`);
   };
 
   useEffect(() => {
@@ -1838,19 +2339,38 @@ const DendroCaptureApp = () => {
   }, [settings.areaShortcut, settings.fullscreenShortcut, recordingShortcut, startAreaCapture, openFullscreenPicker]);
 
   const retryPending = async (capture: PendingCapture) => {
-    if (!hasPairedDevice(deviceRef.current)) {
-      setStatus('Pair DendroCapture before retrying queued uploads');
-      return;
-    }
-    if (!settingsRef.current.apiSendingEnabled) {
-      setStatus('API sending is blocked in Connection settings');
+    const destination = queueDestination(capture);
+    if (destination === 'dendroApi') {
+      if (!hasPairedDevice(deviceRef.current)) {
+        setStatus('Pair DendroCapture before retrying Dendro API uploads');
+        return;
+      }
+      if (!settingsRef.current.apiSendingEnabled) {
+        setStatus('API sending is blocked in Connection settings');
+        return;
+      }
+    } else if (!googleDriveCanUpload()) {
+      setStatus('Select Google Drive, paste the OAuth Client ID and Client Secret, and link your account before retrying');
       return;
     }
     setBusy(`retry-${capture.id}`);
-    setStatus('Retrying upload');
+    setStatus(`Retrying ${queueDestinationLabel(capture)} upload`);
     try {
-      await uploadCapture(capture);
-      setStatus('Queued capture uploaded');
+      if (destination === 'googleDrive') {
+        const uploaded = await uploadCaptureToGoogleDrive(capture);
+        updateCaptureRecord({
+          ...capture,
+          googleDriveFileId: uploaded.fileId,
+          googleDriveUrl: uploaded.webViewLink || undefined,
+          googleDriveFolderUrl: uploaded.folderViewLink || undefined,
+        });
+      } else {
+        const uploaded = await uploadCapture(capture);
+        if (uploaded.openUrl) {
+          updateCaptureRecord({ ...capture, assetUrl: uploaded.openUrl });
+        }
+      }
+      setStatus(`${queueDestinationLabel(capture)} queued capture uploaded`);
     } catch (error) {
       setStatus(errorMessage(error, 'Retry failed'));
     } finally {
@@ -1860,18 +2380,16 @@ const DendroCaptureApp = () => {
   };
 
   const retryAllPending = async () => {
-    if (!hasPairedDevice(deviceRef.current)) {
-      setStatus('Pair DendroCapture before retrying queued uploads');
-      return;
-    }
-    if (!settingsRef.current.apiSendingEnabled) {
-      setStatus('API sending is blocked in Connection settings');
-      return;
-    }
+    let retried = 0;
     for (const capture of pending) {
       // Keep this intentionally sequential so the API and worker are not flooded.
+      const destination = queueDestination(capture);
+      if (destination === 'dendroApi' && (!hasPairedDevice(deviceRef.current) || !settingsRef.current.apiSendingEnabled)) continue;
+      if (destination === 'googleDrive' && !googleDriveCanUpload()) continue;
+      retried += 1;
       await retryPending(capture);
     }
+    if (!retried) setStatus('No queued uploads are enabled for retry');
   };
 
   const uploadLatestCapture = async () => {
@@ -1893,14 +2411,15 @@ const DendroCaptureApp = () => {
     let queuedForRetry = false;
     try {
       const pngBase64 = await originalPngForCapture(item);
+      const apiItem: PendingCapture = { ...item, destination: 'dendroApi' };
       if (settingsRef.current.saveLocally) {
-        await invoke('save_pending_capture', { id: item.id, pngBase64 }).catch((error) => {
+        await invoke('save_pending_capture', { id: apiItem.id, pngBase64 }).catch((error) => {
           console.warn('Could not persist manual upload queue item', error);
         });
-        addPending(item);
+        addPending(apiItem);
         queuedForRetry = true;
       }
-      const uploaded = await uploadCapture({ ...item, pngBase64 });
+      const uploaded = await uploadCapture({ ...apiItem, pngBase64 });
       const uploadedItem = uploaded.openUrl ? { ...item, assetUrl: uploaded.openUrl } : item;
       updateCaptureRecord(uploadedItem);
       setLastCapture(uploadedItem);
@@ -1908,7 +2427,7 @@ const DendroCaptureApp = () => {
         await invoke<LocalCaptureSave>('overwrite_local_capture', {
           path: item.filePath,
           pngBase64,
-          metadataJson: metadataForCapture(uploadedItem, item.filePath.split(/[\\/]/).pop() || captureFileName(new Date(item.capturedAt))),
+          metadataJson: metadataForCapture(uploadedItem, item.filePath.split(/[\\/]/).pop() || captureFileName(new Date(item.capturedAt), item)),
         }).catch((error) => {
           console.warn('Could not update local capture metadata after upload', error);
         });
@@ -1925,17 +2444,17 @@ const DendroCaptureApp = () => {
   };
 
   const openLatestAsset = async () => {
-    const url = latestCapture?.assetUrl;
+    const url = onlineImageUrl(latestCapture);
     setPreviewMenuOpen(false);
     if (!url) {
-      setStatus('Upload this capture before opening a share link');
+      setStatus('Upload this capture before opening the online image');
       return;
     }
     try {
       await openUrl(url);
-      setStatus('Opened uploaded asset');
+      setStatus('Opened online image');
     } catch (error) {
-      setStatus(errorMessage(error, 'Could not open uploaded asset'));
+      setStatus(errorMessage(error, 'Could not open online image'));
     }
   };
 
@@ -1953,7 +2472,7 @@ const DendroCaptureApp = () => {
     setStatus('Saving current capture locally');
     try {
       const pngBase64 = await originalPngForCapture(item);
-      const filename = captureFileName(new Date(item.capturedAt));
+      const filename = captureFileName(new Date(item.capturedAt), item);
       const saved = await invoke<LocalCaptureSave>('save_local_capture', {
         filename,
         pngBase64,
@@ -1989,6 +2508,54 @@ const DendroCaptureApp = () => {
     await getCurrentWindow().close().catch(() => undefined);
   };
 
+  const openDestinationHome = async () => {
+    const destination = settingsRef.current.captureDestination;
+    if (destination === 'local') {
+      try {
+        const folderPath = await invoke<string>('local_captures_root_path');
+        await openPath(folderPath);
+        setStatus('Opened local captures folder');
+      } catch (error) {
+        setStatus(errorMessage(error, 'Could not open local captures folder'));
+        setTab('settings');
+        setSettingsSection('local');
+      }
+      return;
+    }
+
+    if (destination === 'googleDrive') {
+      const drive = googleDriveRef.current;
+      const url = drive.linked ? googleDriveFolderUrl(drive.folderId) : undefined;
+      if (url) {
+        try {
+          await openUrl(url);
+          setStatus('Opened Google Drive folder');
+        } catch (error) {
+          setStatus(errorMessage(error, 'Could not open Google Drive folder'));
+        }
+      } else {
+        setTab('settings');
+        setSettingsSection('googleDrive');
+        setStatus('Link Google Drive before opening its folder');
+      }
+      return;
+    }
+
+    if (hasPairedDevice(deviceRef.current)) {
+      const url = dendroCapturesUrl(settingsRef.current.apiBaseUrl) || DENDRO_STUDIOS_CAPTURES_URL;
+      try {
+        await openUrl(url);
+        setStatus('Opened Dendro captures page');
+      } catch (error) {
+        setStatus(errorMessage(error, 'Could not open Dendro captures page'));
+      }
+    } else {
+      setTab('settings');
+      setSettingsSection('dendroApi');
+      setStatus('Pair DendroCapture before opening Dendro captures');
+    }
+  };
+
   const qualityLabel = useMemo(() => `${Math.round(settings.qualityScale * 100)}%`, [settings.qualityScale]);
   const areaDelayLabel = useMemo(() => {
     const seconds = clampNumber(settings.delayedAreaCaptureSeconds, 0, 10);
@@ -2001,10 +2568,51 @@ const DendroCaptureApp = () => {
     { id: 'queue', label: 'Queue', icon: <UploadCloud size={18} />, shortcut: 'Ctrl+3' },
     { id: 'settings', label: 'Settings', icon: <Settings size={18} />, shortcut: 'Ctrl+4' },
   ];
+  const settingsSections: Array<{ id: SettingsSection; label: string; icon: React.ReactNode }> = [
+    { id: 'destination', label: 'Destination', icon: <Crosshair size={15} /> },
+    { id: 'local', label: 'Local', icon: <ImageIcon size={15} /> },
+    { id: 'dendroApi', label: 'Dendro API', icon: <UploadCloud size={15} /> },
+    { id: 'googleDrive', label: 'Google Drive', icon: <Cloud size={15} /> },
+    { id: 'capture', label: 'Capture', icon: <Aperture size={15} /> },
+  ];
   const latestCapture: LocalCapture | null = lastCapture || localCaptures[0] || pending[0] || null;
   const latestPreview = lastCaptureImage || latestCapture?.previewBase64;
   const pairedDevice = hasPairedDevice(device) ? device : null;
   const captureBusy = busy === 'area' || busy === 'fullscreen-picker' || !!busy?.startsWith('fullscreen-');
+  const destinationLabel = captureDestinationLabel(settings.captureDestination);
+  const destinationDetail = settings.captureDestination === 'local'
+    ? 'local storage'
+    : settings.captureDestination === 'dendroApi'
+      ? 'Dendro Assets'
+      : 'Google Drive';
+  const destinationReady = settings.captureDestination === 'local'
+    || (settings.captureDestination === 'dendroApi' && !!pairedDevice)
+    || (settings.captureDestination === 'googleDrive' && googleDrive.linked);
+  const topStatusLabel = settings.captureDestination === 'local'
+    ? 'Local mode'
+    : settings.captureDestination === 'googleDrive'
+      ? googleDrive.linked ? 'Drive linked' : 'Drive not linked'
+      : pairedDevice ? 'Paired' : 'Not paired';
+  const connectionTitle = settings.captureDestination === 'local'
+    ? 'Local mode'
+    : settings.captureDestination === 'googleDrive'
+      ? googleDrive.linked ? 'Google Drive linked' : 'Drive not linked'
+      : pairedDevice ? 'Paired device' : 'Not paired';
+  const connectionDetail = settings.captureDestination === 'local'
+    ? (settings.saveLocally ? 'Saving captures locally' : 'Clipboard only')
+    : settings.captureDestination === 'googleDrive'
+      ? googleDrive.linked
+        ? `Folder: ${googleDrive.folderName || 'DendroCapture'}`
+        : 'Link Google Drive'
+      : pairedDevice
+        ? 'Connected to Dendro Assets'
+        : 'Pair Dendro Assets';
+  const statusPillLabel = settings.captureDestination === 'dendroApi' && pairedDevice
+    ? settings.apiBaseUrl.replace(/^https?:\/\//, '')
+    : settings.captureDestination === 'googleDrive' && googleDrive.linked
+      ? googleDrive.folderName || 'DendroCapture'
+      : destinationLabel;
+  const historyBlockedByCloud = settings.captureDestination !== 'local' && !settings.saveLocally;
   const captureHeaderStatus = captureBusy ? status : 'Fast screenshots, instant clipboard, clean workflow.';
 
   return (
@@ -2024,16 +2632,16 @@ const DendroCaptureApp = () => {
               <img src="/dendro-capture.png" alt="" />
               <strong>DendroCapture</strong>
             </div>
-            <span className="dc-top-caption" data-tauri-drag-region>Screenshot to Dendro Assets</span>
+            <span className="dc-top-caption" data-tauri-drag-region>Screenshot to {destinationDetail}</span>
           </div>
           <div className="dc-top-spacer" />
           <button
             type="button"
-            className={`dc-top-status${pairedDevice ? ' paired' : ' unpaired'}`}
-            onClick={() => setTab('settings')}
+            className={`dc-top-status${destinationReady ? ' paired' : ' unpaired'}`}
+            onClick={() => void openDestinationHome()}
           >
-            {pairedDevice ? <ShieldCheck size={15} /> : <AlertTriangle size={15} />}
-            <span>{pairedDevice ? 'Paired' : 'Not paired'}</span>
+            {destinationReady ? <ShieldCheck size={15} /> : <AlertTriangle size={15} />}
+            <span>{topStatusLabel}</span>
           </button>
           <button type="button" className="dc-top-icon" onClick={() => setTab('settings')} aria-label="Settings">
             <Settings size={18} />
@@ -2054,7 +2662,7 @@ const DendroCaptureApp = () => {
               <img src="/dendro-capture.png" alt="" />
               <span>
                 <strong>DendroCapture</strong>
-                <small>Screenshot to <b>{pairedDevice ? 'Dendro Assets' : 'local storage'}</b></small>
+                <small>Screenshot to <b>{destinationDetail}</b></small>
               </span>
             </div>
             <nav className="dc-nav">
@@ -2071,11 +2679,11 @@ const DendroCaptureApp = () => {
                 </button>
               ))}
             </nav>
-            <button type="button" className={`dc-connection-card${pairedDevice ? ' paired' : ' unpaired'}`} onClick={() => setTab('settings')}>
+            <button type="button" className={`dc-connection-card${destinationReady ? ' paired' : ' unpaired'}`} onClick={() => void openDestinationHome()}>
               <span className="dc-connection-dot" />
               <span>
-                <strong>{pairedDevice ? 'Paired device' : 'Not paired'}</strong>
-                <small>{pairedDevice ? 'Connected to Dendro Assets' : 'Saving captures locally'}</small>
+                <strong>{connectionTitle}</strong>
+                <small>{connectionDetail}</small>
               </span>
               <ChevronRight size={17} />
             </button>
@@ -2089,7 +2697,7 @@ const DendroCaptureApp = () => {
               </div>
               <div className="dc-status-pill">
                 <Cloud size={14} />
-                {pairedDevice ? settings.apiBaseUrl.replace(/^https?:\/\//, '') : 'Local mode'}
+                {statusPillLabel}
               </div>
             </header>
 
@@ -2155,9 +2763,9 @@ const DendroCaptureApp = () => {
                             <UploadCloud size={14} />
                             <span>Upload to Dendro Assets</span>
                           </button>
-                          <button type="button" onClick={() => void openLatestAsset()} disabled={!latestCapture.assetUrl}>
+                          <button type="button" onClick={() => void openLatestAsset()} disabled={!onlineImageUrl(latestCapture)}>
                             <Link size={14} />
-                            <span>Share link</span>
+                            <span>Open online image</span>
                           </button>
                           <button type="button" onClick={() => void saveLatestCaptureLocally()} disabled={!!busy}>
                             <Download size={14} />
@@ -2226,21 +2834,21 @@ const DendroCaptureApp = () => {
                 <div className="dc-panel-head">
                   <div>
                     <h2>Local History</h2>
-                    <p>Captures taken while unpaired, stored on this device.</p>
+                    <p>Captures stored on this device.</p>
                   </div>
-                  <span>{pairedDevice ? 'Paired' : `${localCaptures.length} captures`}</span>
+                  <span>{`${localCaptures.length} captures`}</span>
                 </div>
-                {pairedDevice ? (
+                {historyBlockedByCloud ? (
                   <div className="dc-empty-drop">
                     <Cloud size={36} />
-                    <strong>History is off while paired</strong>
-                    <span>Captures upload to Dendro Assets instead. Unpair to keep captures locally.</span>
+                    <strong>Local history is off</strong>
+                    <span>Turn on Save captures locally or choose Local as the destination.</span>
                   </div>
                 ) : localCaptures.length === 0 ? (
                   <div className="dc-empty-drop">
                     <ImageIcon size={36} />
                     <strong>No local captures yet</strong>
-                    <span>Use Capture Area or Capture Fullscreen while unpaired.</span>
+                    <span>Use Capture Area or Capture Fullscreen with local saving enabled.</span>
                   </div>
                 ) : (
                   <div className="dc-history-grid">
@@ -2278,9 +2886,9 @@ const DendroCaptureApp = () => {
                 <div className="dc-panel-head">
                   <div>
                     <h2>Upload Queue</h2>
-                    <p>Only paired uploads that fail are stored here for retry.</p>
+                    <p>Failed Dendro API and Google Drive uploads stored for retry.</p>
                   </div>
-                  <button type="button" className="dc-btn" disabled={!pending.length || !settings.apiSendingEnabled || !!busy} onClick={() => void retryAllPending()}>
+                  <button type="button" className="dc-btn" disabled={!pending.length || !!busy} onClick={() => void retryAllPending()}>
                     <RefreshCw size={14} />
                     Retry All
                   </button>
@@ -2292,15 +2900,19 @@ const DendroCaptureApp = () => {
                     <span>Local-only captures live in History instead.</span>
                   </div>
                 ) : pending.map((item) => (
-                  <div className="dc-queue-row" key={item.id}>
+                  <div className="dc-queue-row" key={`${item.id}-${queueDestination(item)}`}>
                     {item.previewBase64
                       ? <img src={dataUrl(item.previewBase64)} alt="" className="dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)} />
                       : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}><Aperture size={16} /></div>}
                     <span>
                       <strong>{captureTitle(item)}</strong>
-                      <small>{item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
+                      <small>{queueDestinationLabel(item)} - {item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
                     </span>
-                    <button type="button" onClick={() => void retryPending(item)} disabled={!settings.apiSendingEnabled || !!busy}>
+                    <button
+                      type="button"
+                      onClick={() => void retryPending(item)}
+                      disabled={!!busy || (queueDestination(item) === 'dendroApi' ? !settings.apiSendingEnabled : !googleDriveCanUpload())}
+                    >
                       <RefreshCw size={14} />
                     </button>
                   </div>
@@ -2310,8 +2922,92 @@ const DendroCaptureApp = () => {
 
             {tab === 'settings' && (
               <section className="dc-settings">
+                <div className="dc-settings-tabs">
+                  {settingsSections.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={settingsSection === item.id ? 'active' : ''}
+                      onClick={() => setSettingsSection(item.id)}
+                    >
+                      {item.icon}
+                      <span>{item.label}</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="dc-settings-content">
+                {settingsSection === 'destination' && (
+                <div className="dc-panel dc-destination-panel">
+                  <h2>Destination</h2>
+                  <div className="dc-destination-grid">
+                    <button
+                      type="button"
+                      className={`dc-destination-option${settings.captureDestination === 'local' ? ' active' : ''}`}
+                      onClick={() => selectCaptureDestination('local')}
+                    >
+                      <ImageIcon size={18} />
+                      <span>
+                        <strong>Local</strong>
+                        <small>Save captures on this computer.</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`dc-destination-option${settings.captureDestination === 'dendroApi' ? ' active' : ''}`}
+                      onClick={() => selectCaptureDestination('dendroApi')}
+                    >
+                      <UploadCloud size={18} />
+                      <span>
+                        <strong>Dendro API</strong>
+                        <small>Upload to your Dendro Assets account.</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`dc-destination-option${settings.captureDestination === 'googleDrive' ? ' active' : ''}`}
+                      onClick={() => selectCaptureDestination('googleDrive')}
+                    >
+                      <Cloud size={18} />
+                      <span>
+                        <strong>Google Drive</strong>
+                        <small>Upload to a DendroCapture Drive folder.</small>
+                      </span>
+                    </button>
+                  </div>
+                </div>
+                )}
+
+                {settingsSection === 'local' && (
                 <div className="dc-panel">
-                  <h2>Connection</h2>
+                  <h2>Local</h2>
+                  <p className="dc-muted">Local captures are written to this computer. Clipboard copy still happens even when local saving is off for cloud destinations.</p>
+                  <button
+                    type="button"
+                    className={`dc-api-toggle ${settings.captureDestination === 'local' ? 'on' : 'off'}`}
+                    onClick={() => selectCaptureDestination('local')}
+                  >
+                    {settings.captureDestination === 'local' ? <CheckCircle2 size={16} /> : <ImageIcon size={16} />}
+                    <span>{settings.captureDestination === 'local' ? 'Local is selected' : 'Use Local destination'}</span>
+                  </button>
+                  <label className="dc-check dc-check-with-hint">
+                    <input
+                      type="checkbox"
+                      checked={settings.saveLocally}
+                      disabled={settings.captureDestination === 'local'}
+                      onChange={(e) => updateSettings({ saveLocally: e.target.checked })}
+                    />
+                    <span>
+                      Save captures locally
+                      <small>Required for Local destination. For cloud destinations, this keeps local history and retry files.</small>
+                    </span>
+                  </label>
+                </div>
+                )}
+
+                {settingsSection === 'dendroApi' && (
+                <div className="dc-panel">
+                  <h2>Dendro API</h2>
                   <label>
                     API base URL
                     <input value={settings.apiBaseUrl} onChange={(e) => updateSettings({ apiBaseUrl: e.target.value })} />
@@ -2348,7 +3044,152 @@ const DendroCaptureApp = () => {
                     <p className="dc-muted">Pairing is optional. Without it, captures stay local and are never uploaded.</p>
                   )}
                 </div>
+                )}
 
+                {settingsSection === 'googleDrive' && (
+                <div className="dc-panel">
+                  <h2>Google Drive</h2>
+                  <p className="dc-muted">One-time setup. No Google Drive desktop app is needed; Google only needs permission for DendroCapture to create files in your Drive.</p>
+                  <p className="dc-muted">Captures are stored inside daily subfolders named dendrocapture-YYYY-MM-DD.</p>
+                  <label className="dc-check dc-check-with-hint">
+                    <input
+                      type="checkbox"
+                      checked={settings.googleDriveOcrEnabled}
+                      onChange={(e) => updateSettings({ googleDriveOcrEnabled: e.target.checked })}
+                    />
+                    <span>
+                      Enable OCR
+                      <small>Uploads open immediately. OCR runs afterward and updates the Drive description/search text when it finishes.</small>
+                    </span>
+                  </label>
+                  <div className="dc-drive-help">
+                    <div className="dc-drive-steps">
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">1</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Enable Google Drive API</strong>
+                          <small>Open the Drive API page, choose the Google project, then click Enable if it is not enabled yet.</small>
+                        </span>
+                        <button type="button" className="dc-btn" onClick={() => void openUrl(GOOGLE_DRIVE_API_CONSOLE_URL)}>
+                          <Cloud size={14} />
+                          Open Drive API
+                        </button>
+                      </div>
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">2</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Allow your Google account</strong>
+                          <small>Open Audience before creating the client. This decides which Google accounts are allowed to connect.</small>
+                          <span className="dc-drive-substeps">
+                            <span>Choose External for a normal Gmail account.</span>
+                            <span>If Google shows Testing, click Add users under Test users.</span>
+                            <span>Add the exact Gmail account that will connect to DendroCapture, then save.</span>
+                            <span>If you see 403 access_denied or validation not complete, this test user step is missing.</span>
+                          </span>
+                        </span>
+                        <button type="button" className="dc-btn" onClick={() => void openUrl(GOOGLE_AUTH_AUDIENCE_URL)}>
+                          <Users size={14} />
+                          Open Audience
+                        </button>
+                      </div>
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">3</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Create the OAuth client</strong>
+                          <small>Open Clients last, then create the desktop OAuth credentials DendroCapture will use.</small>
+                          <span className="dc-drive-substeps">
+                            <span>Click Create client.</span>
+                            <span>For Application type, choose Desktop app / Application de bureau.</span>
+                            <span>For Name, enter Dendro Capture.</span>
+                            <span>Click Create, then copy both the Client ID and Client Secret below.</span>
+                          </span>
+                        </span>
+                        <button type="button" className="dc-btn primary" onClick={() => void openUrl(GOOGLE_AUTH_CLIENTS_URL)}>
+                          <ShieldCheck size={14} />
+                          Open Client
+                        </button>
+                      </div>
+                    </div>
+                    <p className="dc-drive-next-step">After creating the client, paste both values below, click Link Google Drive, check the Google Drive permission box, then approve the browser screen.</p>
+                    <div className="dc-drive-troubleshoot">
+                      <AlertTriangle size={15} />
+                      <span>
+                        <strong>Blocked with 403 access_denied?</strong>
+                        <small>Open Audience, add the signing-in Gmail under Test users, save, wait a minute, then click Link Google Drive again.</small>
+                      </span>
+                    </div>
+                    <div className="dc-drive-troubleshoot">
+                      <AlertTriangle size={15} />
+                      <span>
+                        <strong>Blocked with 403 org_internal?</strong>
+                        <small>Open Audience and switch the app to External. Internal only works for Google Workspace organizations.</small>
+                      </span>
+                    </div>
+                    <small className="dc-drive-note">The browser error "validation not complete" usually means the app is in Testing and the Gmail account is not an approved test user yet.</small>
+                    <small className="dc-drive-note">If Google opens any other error page instead of the permission screen, check that Drive API is enabled and the Client ID and Client Secret are copied from the same Desktop app. Google says OAuth changes can take a few minutes to a few hours to apply.</small>
+                    <button type="button" className="dc-inline-link" onClick={() => void openUrl(GOOGLE_CREDENTIALS_DOCS_URL)}>
+                      Google setup documentation
+                    </button>
+                  </div>
+                  <label>
+                    OAuth desktop client ID
+                    <input
+                      value={settings.googleDriveClientId}
+                      placeholder="000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com"
+                      spellCheck={false}
+                      onChange={(e) => updateSettings({ googleDriveClientId: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    OAuth desktop client secret
+                    <input
+                      type="password"
+                      value={settings.googleDriveClientSecret}
+                      placeholder="GOCSPX-xxxxxxxxxxxxxxxxxxxxxxxx"
+                      spellCheck={false}
+                      autoComplete="off"
+                      onChange={(e) => updateSettings({ googleDriveClientSecret: e.target.value })}
+                    />
+                  </label>
+                  {googleDrive.linked ? (
+                    <div className="dc-drive-status">
+                      <CheckCircle2 size={16} />
+                      <span>
+                        <strong>{googleDrive.email || 'Google account linked'}</strong>
+                        <small>Folder: {googleDrive.folderName || 'DendroCapture'}</small>
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="dc-drive-status warning">
+                      <AlertTriangle size={16} />
+                      <span>
+                        <strong>Not linked</strong>
+                        <small>Paste the Client ID and Client Secret, then link Google Drive.</small>
+                      </span>
+                    </div>
+                  )}
+                  <div className="dc-drive-actions">
+                    {!googleDrive.linked ? (
+                      <button
+                        type="button"
+                        className="dc-btn primary"
+                        onClick={() => void linkGoogleDrive()}
+                        disabled={(!!busy && busy !== 'google-drive-link') || !settings.googleDriveClientId.trim() || !settings.googleDriveClientSecret.trim()}
+                      >
+                        <Cloud size={14} />
+                        {busy === 'google-drive-link' ? 'Try link again' : 'Link Google Drive'}
+                      </button>
+                    ) : (
+                      <button type="button" className="dc-btn" onClick={() => void unlinkGoogleDrive()} disabled={busy === 'google-drive-unlink'}>
+                        <X size={14} />
+                        Unlink
+                      </button>
+                    )}
+                  </div>
+                </div>
+                )}
+
+                {settingsSection === 'capture' && (
                 <div className="dc-panel">
                   <h2>Capture</h2>
                   <label>
@@ -2407,7 +3248,7 @@ const DendroCaptureApp = () => {
                       checked={settings.openAfterUpload}
                       onChange={(e) => updateSettings({ openAfterUpload: e.target.checked })}
                     />
-                    Open DendroWebsite after upload
+                    Open image online after upload
                   </label>
                   <label className="dc-check">
                     <input
@@ -2425,18 +3266,7 @@ const DendroCaptureApp = () => {
                     />
                     <span>
                       Live area selection
-                      <small>Keeps videos and other media rendering while you select an area. Right-click before release to use the delay.</small>
-                    </span>
-                  </label>
-                  <label className="dc-check dc-check-with-hint">
-                    <input
-                      type="checkbox"
-                      checked={settings.saveLocally}
-                      onChange={(e) => updateSettings({ saveLocally: e.target.checked })}
-                    />
-                    <span>
-                      Save captures locally
-                      <small>Turn off to keep captures out of local history and the retry queue.</small>
+                      <small>Keeps videos and other media rendering while you select an area. When off, selection uses a frozen screen frame. Right-click before release to use the delay.</small>
                     </span>
                   </label>
                   <label className="dc-check">
@@ -2447,6 +3277,8 @@ const DendroCaptureApp = () => {
                     />
                     Launch DendroCapture when the computer starts
                   </label>
+                </div>
+                )}
                 </div>
 
               </section>

@@ -1,23 +1,29 @@
 {
   "name": "dendro-capture",
-  "version": "0.1.46",
+  "version": "0.1.63",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "dev:web": "vite --host 127.0.0.1 --port 1420",
+    "dev:web": "node scripts/prepare-ocr-assets.mjs && vite --host 127.0.0.1 --port 1420",
     "build": "tauri build",
     "build:installer": "tauri build && node scripts/package-installer.mjs",
-    "build:web": "vite build",
+    "build:installer:zip": "npm run build:installer && npm run package:installer:zip",
+    "build:installer:signed": "tauri build --config src-tauri/tauri.signing.conf.json && node scripts/package-installer.mjs",
+    "build:web": "node scripts/prepare-ocr-assets.mjs && vite build",
+    "package:installer:zip": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-installer-zip.ps1",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.2",
     "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tesseract.js-data/eng": "^1.0.0",
+    "@tesseract.js-data/fra": "^1.0.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",
