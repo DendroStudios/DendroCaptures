@@ -20,13 +20,17 @@ use std::{
     io::{Cursor, Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 use tauri::{
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Runtime,
+    AppHandle, Emitter, Manager, Runtime,
 };
 
 // Keep the keyring service and keys stable across releases; version-over-version
@@ -42,6 +46,8 @@ const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo
 const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const GOOGLE_DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 static GOOGLE_DRIVE_DAY_FOLDER_CACHE: OnceLock<Mutex<HashMap<(String, String), GoogleDriveFile>>> =
+    OnceLock::new();
+static VIDEO_RECORDINGS: OnceLock<Mutex<HashMap<String, Arc<VideoRecordingControl>>>> =
     OnceLock::new();
 
 #[derive(Debug, Serialize)]
@@ -111,6 +117,69 @@ pub struct LocalCaptureSave {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CaptureFileInfo {
+    file_path: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureFileChunk {
+    bytes_base64: String,
+    bytes_read: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRecordingRequest {
+    id: String,
+    mode: String,
+    monitor_id: Option<u32>,
+    rect: Option<CaptureRegionRect>,
+    duration_ms: u64,
+    frame_rate: u32,
+    include_audio: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRecordingSession {
+    id: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRecordingFinished {
+    id: String,
+    file_path: String,
+    width: u32,
+    height: u32,
+    display_width: u32,
+    display_height: u32,
+    scale_factor: f64,
+    origin_x: i32,
+    origin_y: i32,
+    duration_ms: u64,
+    frame_rate: u32,
+    has_audio: bool,
+    thumbnail_base64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoRecordingProblem {
+    id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GifExportResult {
+    file_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActiveWindowContext {
     app_name: Option<String>,
     window_title: Option<String>,
@@ -140,7 +209,13 @@ pub struct GoogleDriveLinkResult {
 #[serde(rename_all = "camelCase")]
 pub struct GoogleDriveUploadCapture {
     filename: String,
-    png_base64: String,
+    png_base64: Option<String>,
+    file_path: Option<String>,
+    media_kind: Option<String>,
+    mime_type: Option<String>,
+    duration_ms: Option<u64>,
+    frame_rate: Option<u32>,
+    has_audio: Option<bool>,
     day_folder_name: Option<String>,
     capture_id: String,
     captured_at: String,
@@ -224,7 +299,7 @@ struct GoogleDriveFilesList {
     files: Vec<GoogleDriveFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureRegionRect {
     x: i32,
@@ -236,6 +311,26 @@ pub struct CaptureRegionRect {
 struct NativeSelectionResult {
     rect: CaptureRegionRect,
     delayed: bool,
+}
+
+struct VideoRecordingControl {
+    paused: AtomicBool,
+    stopped: AtomicBool,
+    cancelled: AtomicBool,
+    audio_muted: AtomicBool,
+    elapsed_ms: AtomicU64,
+}
+
+impl VideoRecordingControl {
+    fn new() -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            audio_muted: AtomicBool::new(false),
+            elapsed_ms: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -768,10 +863,6 @@ fn google_drive_ocr_description(payload: &GoogleDriveOcrUpdate, ocr_text: Option
     )
 }
 
-fn safe_drive_filename(filename: &str) -> String {
-    safe_local_capture_filename(filename)
-}
-
 fn encode_png(mut image: RgbaImage, quality_scale: f64) -> Result<(Vec<u8>, u32, u32), String> {
     let scale = quality_scale.clamp(0.25, 1.0);
     if scale < 0.999 {
@@ -877,7 +968,32 @@ fn pending_capture_id(id: &str) -> Result<&str, String> {
     }
 }
 
-fn pending_capture_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+fn normalized_media_kind(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("image").trim().to_ascii_lowercase().as_str() {
+        "video" => "video",
+        _ => "image",
+    }
+}
+
+fn media_extension(media_kind: &str) -> &'static str {
+    match normalized_media_kind(Some(media_kind)) {
+        "video" => "mp4",
+        _ => "png",
+    }
+}
+
+fn media_mime_type(media_kind: &str) -> &'static str {
+    match normalized_media_kind(Some(media_kind)) {
+        "video" => "video/mp4",
+        _ => "image/png",
+    }
+}
+
+fn pending_capture_path_for_kind(
+    app: &AppHandle,
+    id: &str,
+    media_kind: &str,
+) -> Result<PathBuf, String> {
     let id = pending_capture_id(id)?;
     let dir = app
         .path()
@@ -885,23 +1001,34 @@ fn pending_capture_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
         .map_err(err)?
         .join("pending-captures");
     fs::create_dir_all(&dir).map_err(err)?;
-    Ok(dir.join(format!("{id}.png")))
+    Ok(dir.join(format!("{id}.{}", media_extension(media_kind))))
 }
 
-fn safe_local_capture_filename(filename: &str) -> String {
+fn pending_capture_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    pending_capture_path_for_kind(app, id, "image")
+}
+
+fn safe_local_media_filename(filename: &str, media_kind: &str) -> String {
+    let extension = media_extension(media_kind);
     let mut clean = filename
         .replace('\0', "")
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         .collect::<String>();
-    if !clean.to_ascii_lowercase().ends_with(".png") {
-        clean.push_str(".png");
+    let expected_suffix = format!(".{extension}");
+    if !clean.to_ascii_lowercase().ends_with(&expected_suffix) {
+        if let Some((stem, _)) = clean.rsplit_once('.') {
+            clean = stem.to_string();
+        }
+        clean.push_str(&expected_suffix);
     }
-    if clean.len() > 120 {
-        clean = format!("{}.png", &clean[..116]);
+    let max_len = 120;
+    if clean.len() > max_len {
+        let stem_len = max_len.saturating_sub(expected_suffix.len());
+        clean = format!("{}{}", &clean[..stem_len], expected_suffix);
     }
-    if clean == ".png" {
-        "dendro-capture.png".to_string()
+    if clean == expected_suffix {
+        format!("dendro-capture.{extension}")
     } else {
         clean
     }
@@ -926,7 +1053,15 @@ fn capture_month_from_filename(filename: &str) -> String {
 }
 
 fn local_capture_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
-    let safe_filename = safe_local_capture_filename(filename);
+    local_capture_media_path(app, filename, "image")
+}
+
+fn local_capture_media_path(
+    app: &AppHandle,
+    filename: &str,
+    media_kind: &str,
+) -> Result<PathBuf, String> {
+    let safe_filename = safe_local_media_filename(filename, media_kind);
     let month = capture_month_from_filename(&safe_filename);
     let dir = app
         .path()
@@ -958,6 +1093,24 @@ fn validated_local_capture_path(app: &AppHandle, path: &str) -> Result<PathBuf, 
     Ok(candidate)
 }
 
+fn app_data_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app.path().app_data_dir().map_err(err)?;
+    fs::create_dir_all(&root).map_err(err)?;
+    Ok(root)
+}
+
+fn validated_app_data_file_path(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
+    let root = app_data_root(app)?.canonicalize().map_err(err)?;
+    let candidate = PathBuf::from(path).canonicalize().map_err(err)?;
+    if !candidate.starts_with(&root) {
+        return Err("Capture file is outside the DendroCapture data folder".to_string());
+    }
+    if !candidate.is_file() {
+        return Err("Capture file no longer exists".to_string());
+    }
+    Ok(candidate)
+}
+
 #[tauri::command]
 async fn save_pending_capture(
     app: AppHandle,
@@ -970,10 +1123,46 @@ async fn save_pending_capture(
 }
 
 #[tauri::command]
+async fn save_pending_capture_file(
+    app: AppHandle,
+    id: String,
+    source_path: String,
+    media_kind: Option<String>,
+) -> Result<CaptureFileInfo, String> {
+    let media_kind = normalized_media_kind(media_kind.as_deref());
+    let source = validated_app_data_file_path(&app, &source_path)?;
+    let path = pending_capture_path_for_kind(&app, &id, media_kind)?;
+    fs::copy(&source, &path).map_err(err)?;
+    let size = fs::metadata(&path).map_err(err)?.len();
+    Ok(CaptureFileInfo {
+        file_path: path.to_string_lossy().to_string(),
+        size,
+    })
+}
+
+#[tauri::command]
 async fn read_pending_capture(app: AppHandle, id: String) -> Result<String, String> {
     let path = pending_capture_path(&app, &id)?;
     let bytes = fs::read(path).map_err(err)?;
     Ok(BASE64.encode(bytes))
+}
+
+#[tauri::command]
+async fn pending_capture_file_info(
+    app: AppHandle,
+    id: String,
+    media_kind: Option<String>,
+) -> Result<CaptureFileInfo, String> {
+    let path = pending_capture_path_for_kind(
+        &app,
+        &id,
+        normalized_media_kind(media_kind.as_deref()),
+    )?;
+    let size = fs::metadata(&path).map_err(err)?.len();
+    Ok(CaptureFileInfo {
+        file_path: path.to_string_lossy().to_string(),
+        size,
+    })
 }
 
 #[tauri::command]
@@ -985,13 +1174,77 @@ async fn read_local_capture(app: AppHandle, path: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-fn delete_pending_capture(app: AppHandle, id: String) -> Result<(), String> {
-    let path = pending_capture_path(&app, &id)?;
+async fn capture_file_info(app: AppHandle, path: String) -> Result<CaptureFileInfo, String> {
+    let path = validated_app_data_file_path(&app, &path)?;
+    let size = fs::metadata(&path).map_err(err)?.len();
+    Ok(CaptureFileInfo {
+        file_path: path.to_string_lossy().to_string(),
+        size,
+    })
+}
+
+#[tauri::command]
+async fn read_capture_file_chunk(
+    app: AppHandle,
+    path: String,
+    offset: u64,
+    length: usize,
+) -> Result<CaptureFileChunk, String> {
+    let path = validated_app_data_file_path(&app, &path)?;
+    let mut file = fs::File::open(path).map_err(err)?;
+    let length = length.clamp(1, 16 * 1024 * 1024);
+    let mut buffer = vec![0_u8; length];
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(offset)).map_err(err)?;
+    let bytes_read = file.read(&mut buffer).map_err(err)?;
+    buffer.truncate(bytes_read);
+    Ok(CaptureFileChunk {
+        bytes_base64: BASE64.encode(buffer),
+        bytes_read,
+    })
+}
+
+#[tauri::command]
+async fn sha256_capture_file(app: AppHandle, path: String) -> Result<String, String> {
+    let path = validated_app_data_file_path(&app, &path)?;
+    let mut file = fs::File::open(path).map_err(err)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(err)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
+}
+
+#[tauri::command]
+fn delete_capture_file(app: AppHandle, path: String) -> Result<(), String> {
+    let path = validated_app_data_file_path(&app, &path)?;
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[tauri::command]
+fn delete_pending_capture(app: AppHandle, id: String) -> Result<(), String> {
+    for media_kind in ["image", "video"] {
+        let path = pending_capture_path_for_kind(&app, &id, media_kind)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1005,6 +1258,27 @@ async fn save_local_capture(
     image::load_from_memory(&bytes).map_err(err)?;
     let path = local_capture_path(&app, &filename)?;
     fs::write(&path, bytes).map_err(err)?;
+    if !metadata_json.trim().is_empty() {
+        let metadata_path = path.with_extension("json");
+        fs::write(metadata_path, metadata_json).map_err(err)?;
+    }
+    Ok(LocalCaptureSave {
+        file_path: path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+async fn save_local_capture_file(
+    app: AppHandle,
+    filename: String,
+    source_path: String,
+    media_kind: Option<String>,
+    metadata_json: String,
+) -> Result<LocalCaptureSave, String> {
+    let media_kind = normalized_media_kind(media_kind.as_deref());
+    let source = validated_app_data_file_path(&app, &source_path)?;
+    let path = local_capture_media_path(&app, &filename, media_kind)?;
+    fs::copy(&source, &path).map_err(err)?;
     if !metadata_json.trim().is_empty() {
         let metadata_path = path.with_extension("json");
         fs::write(metadata_path, metadata_json).map_err(err)?;
@@ -1194,15 +1468,21 @@ async fn google_drive_unlink() -> Result<(), String> {
 
 #[tauri::command]
 async fn google_drive_upload_capture(
+    app: AppHandle,
     payload: GoogleDriveUploadCapture,
 ) -> Result<GoogleDriveUploadResult, String> {
     let state = load_google_drive_state()?
         .ok_or_else(|| "Link Google Drive before uploading captures".to_string())?;
     let client = reqwest::Client::new();
     let access_token = google_drive_access_token(&client, &state).await?;
-    let png = BASE64.decode(payload.png_base64.as_bytes()).map_err(err)?;
+    let media_kind = normalized_media_kind(payload.media_kind.as_deref());
+    let mime_type = payload
+        .mime_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| media_mime_type(media_kind));
 
-    let filename = safe_drive_filename(&payload.filename);
+    let filename = safe_local_media_filename(&payload.filename, media_kind);
     let day_folder_name =
         safe_drive_folder_name(payload.day_folder_name.as_deref(), &payload.captured_at);
     let day_folder = find_or_create_google_drive_child_folder(
@@ -1213,15 +1493,19 @@ async fn google_drive_upload_capture(
     )
     .await?;
     let day_folder_id = day_folder.id.clone();
-    let indexable_text = payload
-        .ocr_text
-        .as_deref()
-        .and_then(truncate_indexable_text);
+    let indexable_text = if media_kind == "image" {
+        payload
+            .ocr_text
+            .as_deref()
+            .and_then(truncate_indexable_text)
+    } else {
+        None
+    };
     let ocr_indexed = indexable_text.is_some();
     let description = google_drive_description(&payload, indexable_text.as_deref());
     let mut metadata = json!({
         "name": filename.clone(),
-        "mimeType": "image/png",
+        "mimeType": mime_type,
         "parents": [day_folder_id],
         "description": description,
         "appProperties": {
@@ -1229,6 +1513,8 @@ async fn google_drive_upload_capture(
             "capturedAt": clean_drive_app_property(&payload.captured_at, 64),
             "driveDayFolder": clean_drive_app_property(&day_folder_name, 120),
             "mode": clean_drive_app_property(&payload.mode, 24),
+            "mediaKind": clean_drive_app_property(media_kind, 24),
+            "mimeType": clean_drive_app_property(mime_type, 64),
             "width": payload.width.to_string(),
             "height": payload.height.to_string(),
             "displayWidth": payload.display_width.to_string(),
@@ -1236,6 +1522,15 @@ async fn google_drive_upload_capture(
             "scaleFactor": clean_drive_app_property(payload.scale_factor, 24),
         }
     });
+    if let Some(duration_ms) = payload.duration_ms {
+        metadata["appProperties"]["durationMs"] = json!(duration_ms.to_string());
+    }
+    if let Some(frame_rate) = payload.frame_rate {
+        metadata["appProperties"]["frameRate"] = json!(frame_rate.to_string());
+    }
+    if let Some(has_audio) = payload.has_audio {
+        metadata["appProperties"]["hasAudio"] = json!(has_audio.to_string());
+    }
     if let Some(text) = indexable_text.as_deref() {
         metadata["contentHints"] = json!({ "indexableText": text });
     }
@@ -1243,10 +1538,29 @@ async fn google_drive_upload_capture(
     let metadata_part = multipart::Part::bytes(serde_json::to_vec(&metadata).map_err(err)?)
         .mime_str("application/json; charset=UTF-8")
         .map_err(err)?;
-    let media_part = multipart::Part::bytes(png)
-        .file_name(filename)
-        .mime_str("image/png")
-        .map_err(err)?;
+    let media_part = if media_kind == "video" {
+        let source_path = payload
+            .file_path
+            .as_deref()
+            .ok_or_else(|| "Video file path is missing".to_string())?;
+        let path = validated_app_data_file_path(&app, source_path)?;
+        multipart::Part::file(path)
+            .await
+            .map_err(|error| format!("Could not read video for Google Drive upload: {error}"))?
+            .file_name(filename)
+            .mime_str(mime_type)
+            .map_err(err)?
+    } else {
+        let png_base64 = payload
+            .png_base64
+            .as_deref()
+            .ok_or_else(|| "PNG data is missing".to_string())?;
+        let png = BASE64.decode(png_base64.as_bytes()).map_err(err)?;
+        multipart::Part::bytes(png)
+            .file_name(filename)
+            .mime_str(mime_type)
+            .map_err(err)?
+    };
     let form = multipart::Form::new()
         .part("metadata", metadata_part)
         .part("media", media_part);
@@ -2200,6 +2514,683 @@ async fn native_area_capture(
     }
 }
 
+#[tauri::command]
+fn select_area_region(
+    cursor_x: Option<i32>,
+    cursor_y: Option<i32>,
+) -> Result<CaptureRegionRect, String> {
+    match native_select_region_alpha_window(cursor_x, cursor_y) {
+        Ok(selection) => Ok(selection.rect),
+        Err(error) if error == "Area capture canceled" => Err(error),
+        Err(_) => native_select_region(cursor_x, cursor_y)
+            .map(|selection| selection.rect)
+            .map_err(err),
+    }
+}
+
+fn video_recordings() -> &'static Mutex<HashMap<String, Arc<VideoRecordingControl>>> {
+    VIDEO_RECORDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_video_recording_control(id: &str) -> Result<Arc<VideoRecordingControl>, String> {
+    let id = pending_capture_id(id)?;
+    let recordings = video_recordings().lock().map_err(err)?;
+    recordings
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "Recording session was not found".to_string())
+}
+
+#[tauri::command]
+fn set_video_recording_paused(id: String, paused: bool) -> Result<(), String> {
+    let control = get_video_recording_control(&id)?;
+    control.paused.store(paused, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_video_recording(id: String) -> Result<(), String> {
+    let control = get_video_recording_control(&id)?;
+    control.stopped.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_video_recording(id: String) -> Result<(), String> {
+    let control = get_video_recording_control(&id)?;
+    control.cancelled.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn set_video_recording_audio_muted(id: String, muted: bool) -> Result<(), String> {
+    let control = get_video_recording_control(&id)?;
+    control.audio_muted.store(muted, Ordering::Relaxed);
+    Ok(())
+}
+
+fn recording_output_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    let id = pending_capture_id(id)?;
+    let dir = app_data_root(app)?.join("recordings");
+    fs::create_dir_all(&dir).map_err(err)?;
+    Ok(dir.join(format!("{id}.mp4")))
+}
+
+fn even_video_dimension(value: u32) -> u32 {
+    if value <= 2 {
+        2
+    } else if value % 2 == 0 {
+        value
+    } else {
+        value - 1
+    }
+}
+
+fn capture_area_thumbnail(rect: CaptureRegionRect, max_width: u32) -> Result<String, String> {
+    let screen = screen_for_point(Some(rect.x), Some(rect.y))?;
+    let info = screen.display_info;
+    let image = screen.capture().map_err(err)?;
+    let scale_x = image.width() as f64 / f64::from(info.width.max(1));
+    let scale_y = image.height() as f64 / f64::from(info.height.max(1));
+    let x = (((rect.x - info.x) as f64) * scale_x)
+        .round()
+        .clamp(0.0, image.width().saturating_sub(1) as f64) as u32;
+    let y = (((rect.y - info.y) as f64) * scale_y)
+        .round()
+        .clamp(0.0, image.height().saturating_sub(1) as f64) as u32;
+    let width = ((f64::from(rect.width.max(1)) * scale_x).round().max(1.0) as u32)
+        .min(image.width() - x)
+        .max(1);
+    let height = ((f64::from(rect.height.max(1)) * scale_y).round().max(1.0) as u32)
+        .min(image.height() - y)
+        .max(1);
+    let cropped = imageops::crop_imm(&image, x, y, width, height).to_image();
+    let scale = (max_width as f64 / cropped.width().max(1) as f64).min(1.0);
+    let thumb = if scale < 0.999 {
+        imageops::resize(
+            &cropped,
+            ((cropped.width() as f64) * scale).round().max(1.0) as u32,
+            ((cropped.height() as f64) * scale).round().max(1.0) as u32,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        cropped
+    };
+    let (png, _, _) = encode_png(thumb, 1.0)?;
+    Ok(BASE64.encode(png))
+}
+
+fn capture_display_thumbnail(monitor_id: u32, max_width: u32) -> Result<String, String> {
+    let screen = Screen::all()
+        .map_err(err)?
+        .into_iter()
+        .find(|screen| screen.display_info.id == monitor_id)
+        .ok_or_else(|| "Selected display was not found".to_string())?;
+    let image = screen.capture().map_err(err)?;
+    let scale = (max_width as f64 / image.width().max(1) as f64).min(1.0);
+    let thumb = if scale < 0.999 {
+        imageops::resize(
+            &image,
+            ((image.width() as f64) * scale).round().max(1.0) as u32,
+            ((image.height() as f64) * scale).round().max(1.0) as u32,
+            imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+    let (png, _, _) = encode_png(thumb, 1.0)?;
+    Ok(BASE64.encode(png))
+}
+
+#[cfg(target_os = "windows")]
+mod windows_video_recording {
+    use super::*;
+    use std::collections::VecDeque;
+    use wasapi::{
+        initialize_mta, deinitialize, DeviceEnumerator, Direction, SampleType, StreamMode,
+        WaveFormat,
+    };
+    use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
+    use windows_capture::encoder::{
+        AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
+        VideoSettingsSubType,
+    };
+    use windows_capture::frame::Frame;
+    use windows_capture::graphics_capture_api::InternalCaptureControl;
+    use windows_capture::monitor::Monitor;
+    use windows_capture::settings::{
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+    };
+
+    #[derive(Clone, Copy)]
+    struct VideoCrop {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    }
+
+    struct PreparedRecording {
+        monitor_index: usize,
+        width: u32,
+        height: u32,
+        display_width: u32,
+        display_height: u32,
+        scale_factor: f64,
+        origin_x: i32,
+        origin_y: i32,
+        crop: VideoCrop,
+        thumbnail_base64: Option<String>,
+    }
+
+    struct VideoRecorderFlags {
+        output_path: PathBuf,
+        width: u32,
+        height: u32,
+        crop: VideoCrop,
+        duration_ms: u64,
+        frame_rate: u32,
+        include_audio: bool,
+        control: Arc<VideoRecordingControl>,
+        audio_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    }
+
+    struct VideoRecorder {
+        encoder: Option<VideoEncoder>,
+        control: Arc<VideoRecordingControl>,
+        crop: VideoCrop,
+        duration: Duration,
+        started: Instant,
+        paused_started: Option<Instant>,
+        paused_total: Duration,
+        audio_rx: Option<mpsc::Receiver<Vec<u8>>>,
+        scratch: Vec<u8>,
+        encode_scratch: Vec<u8>,
+    }
+
+    impl VideoRecorder {
+        fn active_elapsed(&mut self) -> Duration {
+            let now = Instant::now();
+            if self.control.paused.load(Ordering::Relaxed) {
+                if self.paused_started.is_none() {
+                    self.paused_started = Some(now);
+                }
+            } else if let Some(paused_started) = self.paused_started.take() {
+                self.paused_total += now.saturating_duration_since(paused_started);
+            }
+            let paused_current = self
+                .paused_started
+                .map(|started| now.saturating_duration_since(started))
+                .unwrap_or_default();
+            now.saturating_duration_since(self.started)
+                .saturating_sub(self.paused_total + paused_current)
+        }
+
+        fn finish(&mut self, capture_control: InternalCaptureControl) -> Result<(), String> {
+            if !self.control.cancelled.load(Ordering::Relaxed) {
+                if let Some(encoder) = self.encoder.take() {
+                    encoder.finish().map_err(err)?;
+                }
+            } else {
+                self.encoder.take();
+            }
+            capture_control.stop();
+            Ok(())
+        }
+
+        fn drain_audio(&mut self) -> Result<(), String> {
+            let Some(rx) = self.audio_rx.as_ref() else {
+                return Ok(());
+            };
+            if self.control.audio_muted.load(Ordering::Relaxed) {
+                while rx.try_recv().is_ok() {}
+                return Ok(());
+            }
+            let Some(encoder) = self.encoder.as_mut() else {
+                return Ok(());
+            };
+            while let Ok(chunk) = rx.try_recv() {
+                encoder.send_audio_buffer(&chunk, 0).map_err(err)?;
+            }
+            Ok(())
+        }
+
+        fn discard_audio(&mut self) {
+            if let Some(rx) = self.audio_rx.as_ref() {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+    }
+
+    fn copy_bgra_top_down_to_bottom_up(
+        source: &[u8],
+        width: u32,
+        height: u32,
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let row_len = width as usize * 4;
+        let frame_len = row_len
+            .checked_mul(height as usize)
+            .ok_or_else(|| "Captured video frame is too large".to_string())?;
+        if source.len() < frame_len {
+            return Err("Captured video frame buffer was shorter than expected".to_string());
+        }
+        output.resize(frame_len, 0);
+        for y in 0..height as usize {
+            let source_start = y * row_len;
+            let output_start = (height as usize - 1 - y) * row_len;
+            output[output_start..output_start + row_len]
+                .copy_from_slice(&source[source_start..source_start + row_len]);
+        }
+        Ok(())
+    }
+
+    impl GraphicsCaptureApiHandler for VideoRecorder {
+        type Flags = VideoRecorderFlags;
+        type Error = String;
+
+        fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+            let video_settings = VideoSettingsBuilder::new(ctx.flags.width, ctx.flags.height)
+                .sub_type(VideoSettingsSubType::H264)
+                .frame_rate(ctx.flags.frame_rate)
+                .bitrate(12_000_000);
+            let audio_settings = AudioSettingsBuilder::default().disabled(!ctx.flags.include_audio);
+            let encoder = VideoEncoder::new(
+                video_settings,
+                audio_settings,
+                ContainerSettingsBuilder::default(),
+                &ctx.flags.output_path,
+            )
+            .map_err(err)?;
+
+            Ok(Self {
+                encoder: Some(encoder),
+                control: ctx.flags.control,
+                crop: ctx.flags.crop,
+                duration: Duration::from_millis(ctx.flags.duration_ms),
+                started: Instant::now(),
+                paused_started: None,
+                paused_total: Duration::ZERO,
+                audio_rx: ctx.flags.audio_rx,
+                scratch: Vec::new(),
+                encode_scratch: Vec::new(),
+            })
+        }
+
+        fn on_frame_arrived(
+            &mut self,
+            frame: &mut Frame,
+            capture_control: InternalCaptureControl,
+        ) -> Result<(), Self::Error> {
+            let elapsed = self.active_elapsed();
+            self.control
+                .elapsed_ms
+                .store(elapsed.as_millis() as u64, Ordering::Relaxed);
+
+            if self.control.cancelled.load(Ordering::Relaxed)
+                || self.control.stopped.load(Ordering::Relaxed)
+                || elapsed >= self.duration
+            {
+                return self.finish(capture_control);
+            }
+
+            if self.control.paused.load(Ordering::Relaxed) {
+                self.discard_audio();
+                return Ok(());
+            }
+
+            let timestamp = (elapsed.as_secs_f64() * 10_000_000.0).round() as i64;
+            let crop_end_x = self.crop.x.saturating_add(self.crop.width).min(frame.width());
+            let crop_end_y = self.crop.y.saturating_add(self.crop.height).min(frame.height());
+            if crop_end_x <= self.crop.x || crop_end_y <= self.crop.y {
+                return Err("Selected video region is outside the captured display".to_string());
+            }
+            let buffer = frame
+                .buffer_crop(self.crop.x, self.crop.y, crop_end_x, crop_end_y)
+                .map_err(err)?;
+            let bytes = buffer.as_nopadding_buffer(&mut self.scratch);
+            copy_bgra_top_down_to_bottom_up(
+                bytes,
+                self.crop.width,
+                self.crop.height,
+                &mut self.encode_scratch,
+            )?;
+            if let Some(encoder) = self.encoder.as_mut() {
+                encoder
+                    .send_frame_buffer(&self.encode_scratch, timestamp)
+                    .map_err(err)?;
+            }
+            self.drain_audio()?;
+            Ok(())
+        }
+
+        fn on_closed(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn prepare_request(request: &VideoRecordingRequest) -> Result<PreparedRecording, String> {
+        let screens = Screen::all().map_err(err)?;
+        if screens.is_empty() {
+            return Err("No display was found".to_string());
+        }
+
+        let (screen_index, rect) = if request.mode == "fullscreen" {
+            let monitor_id = request.monitor_id.unwrap_or(screens[0].display_info.id);
+            let index = screens
+                .iter()
+                .position(|screen| screen.display_info.id == monitor_id)
+                .ok_or_else(|| "Selected display was not found".to_string())?;
+            (index, None)
+        } else {
+            let rect = request
+                .rect
+                .clone()
+                .ok_or_else(|| "Video area is missing".to_string())?;
+            let index = screens
+                .iter()
+                .position(|screen| {
+                    let info = screen.display_info;
+                    rect.x >= info.x
+                        && rect.y >= info.y
+                        && rect.x < info.x + info.width as i32
+                        && rect.y < info.y + info.height as i32
+                })
+                .unwrap_or(0);
+            (index, Some(rect))
+        };
+
+        let info = screens[screen_index].display_info;
+        let full_width = even_video_dimension(info.width);
+        let full_height = even_video_dimension(info.height);
+        let (crop, origin_x, origin_y, display_width, display_height, thumbnail_base64) =
+            if let Some(rect) = rect {
+                let x = (rect.x - info.x).max(0) as u32;
+                let y = (rect.y - info.y).max(0) as u32;
+                let width = even_video_dimension(rect.width.min(info.width.saturating_sub(x)).max(2));
+                let height = even_video_dimension(rect.height.min(info.height.saturating_sub(y)).max(2));
+                (
+                    VideoCrop { x, y, width, height },
+                    rect.x,
+                    rect.y,
+                    width,
+                    height,
+                    capture_area_thumbnail(rect, 420).ok(),
+                )
+            } else {
+                (
+                    VideoCrop {
+                        x: 0,
+                        y: 0,
+                        width: full_width,
+                        height: full_height,
+                    },
+                    info.x,
+                    info.y,
+                    full_width,
+                    full_height,
+                    capture_display_thumbnail(info.id, 420).ok(),
+                )
+            };
+
+        Ok(PreparedRecording {
+            monitor_index: screen_index + 1,
+            width: crop.width,
+            height: crop.height,
+            display_width,
+            display_height,
+            scale_factor: f64::from(info.scale_factor),
+            origin_x,
+            origin_y,
+            crop,
+            thumbnail_base64,
+        })
+    }
+
+    fn spawn_audio_loopback(
+        tx: mpsc::SyncSender<Vec<u8>>,
+        control: Arc<VideoRecordingControl>,
+    ) -> std::thread::JoinHandle<Result<(), String>> {
+        std::thread::Builder::new()
+            .name("DendroCapture WASAPI loopback".to_string())
+            .spawn(move || {
+                initialize_mta().ok().map_err(err)?;
+                let result = (|| -> Result<(), String> {
+                    let enumerator = DeviceEnumerator::new().map_err(err)?;
+                    let device = enumerator
+                        .get_default_device(&Direction::Render)
+                        .map_err(err)?;
+                    let mut audio_client = device.get_iaudioclient().map_err(err)?;
+                    let desired_format = WaveFormat::new(16, 16, &SampleType::Int, 48_000, 2, None);
+                    let block_align = desired_format.get_blockalign() as usize;
+                    let (_, min_time) = audio_client.get_device_period().map_err(err)?;
+                    let mode = StreamMode::EventsShared {
+                        autoconvert: true,
+                        buffer_duration_hns: min_time,
+                    };
+                    audio_client
+                        .initialize_client(&desired_format, &Direction::Capture, &mode)
+                        .map_err(err)?;
+                    let event = audio_client.set_get_eventhandle().map_err(err)?;
+                    let buffer_frame_count = audio_client.get_buffer_size().map_err(err)?;
+                    let capture_client = audio_client.get_audiocaptureclient().map_err(err)?;
+                    let mut sample_queue = VecDeque::<u8>::with_capacity(
+                        100 * block_align * (1024 + 2 * buffer_frame_count as usize),
+                    );
+                    let chunk_frames = 4096_usize;
+                    let chunk_len = block_align * chunk_frames;
+                    audio_client.start_stream().map_err(err)?;
+
+                    while !control.cancelled.load(Ordering::Relaxed)
+                        && !control.stopped.load(Ordering::Relaxed)
+                    {
+                        capture_client
+                            .read_from_device_to_deque(&mut sample_queue)
+                            .map_err(err)?;
+                        if control.paused.load(Ordering::Relaxed) {
+                            sample_queue.clear();
+                        }
+                        while sample_queue.len() >= chunk_len {
+                            let mut chunk = vec![0_u8; chunk_len];
+                            for value in chunk.iter_mut() {
+                                *value = sample_queue.pop_front().unwrap_or_default();
+                            }
+                            if !control.paused.load(Ordering::Relaxed) {
+                                let _ = tx.try_send(chunk);
+                            }
+                        }
+                        let _ = event.wait_for_event(250);
+                    }
+                    audio_client.stop_stream().map_err(err)?;
+                    Ok(())
+                })();
+                deinitialize();
+                result
+            })
+            .unwrap_or_else(|error| {
+                std::thread::spawn(move || Err(format!("Could not start audio capture: {error}")))
+            })
+    }
+
+    pub fn start(app: AppHandle, request: VideoRecordingRequest) -> Result<VideoRecordingSession, String> {
+        let id = pending_capture_id(&request.id)?.to_string();
+        let duration_ms = request.duration_ms.clamp(1_000, 120_000);
+        let frame_rate = request.frame_rate.clamp(1, 30);
+        let prepared = prepare_request(&request)?;
+        let output_path = recording_output_path(&app, &id)?;
+        let _ = fs::remove_file(&output_path);
+        let control = Arc::new(VideoRecordingControl::new());
+
+        {
+            let mut recordings = video_recordings().lock().map_err(err)?;
+            if recordings.contains_key(&id) {
+                return Err("Recording session already exists".to_string());
+            }
+            recordings.insert(id.clone(), control.clone());
+        }
+
+        let (audio_tx, audio_rx, audio_handle) = if request.include_audio {
+            let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+            let handle = spawn_audio_loopback(tx.clone(), control.clone());
+            (Some(tx), Some(rx), Some(handle))
+        } else {
+            (None, None, None)
+        };
+        drop(audio_tx);
+
+        let app_for_thread = app.clone();
+        let id_for_thread = id.clone();
+        let output_for_thread = output_path.clone();
+        let include_audio = request.include_audio;
+        let finished = VideoRecordingFinished {
+            id: id.clone(),
+            file_path: output_path.to_string_lossy().to_string(),
+            width: prepared.width,
+            height: prepared.height,
+            display_width: prepared.display_width,
+            display_height: prepared.display_height,
+            scale_factor: prepared.scale_factor,
+            origin_x: prepared.origin_x,
+            origin_y: prepared.origin_y,
+            duration_ms,
+            frame_rate,
+            has_audio: include_audio,
+            thumbnail_base64: prepared.thumbnail_base64.clone(),
+        };
+
+        std::thread::Builder::new()
+            .name("DendroCapture video recorder".to_string())
+            .spawn(move || {
+                let result = (|| -> Result<(), String> {
+                    let monitor = Monitor::from_index(prepared.monitor_index).map_err(err)?;
+                    let settings = Settings::new(
+                        monitor,
+                        CursorCaptureSettings::WithCursor,
+                        DrawBorderSettings::WithoutBorder,
+                        SecondaryWindowSettings::Default,
+                        MinimumUpdateIntervalSettings::Custom(Duration::from_millis(
+                            (1000 / frame_rate.max(1)) as u64,
+                        )),
+                        DirtyRegionSettings::Default,
+                        ColorFormat::Bgra8,
+                        VideoRecorderFlags {
+                            output_path: output_for_thread.clone(),
+                            width: prepared.width,
+                            height: prepared.height,
+                            crop: prepared.crop,
+                            duration_ms,
+                            frame_rate,
+                            include_audio,
+                            control: control.clone(),
+                            audio_rx,
+                        },
+                    );
+                    VideoRecorder::start(settings).map_err(err)
+                })();
+
+                control.stopped.store(true, Ordering::Relaxed);
+                if let Some(handle) = audio_handle {
+                    let _ = handle.join();
+                }
+                if control.cancelled.load(Ordering::Relaxed) {
+                    let _ = fs::remove_file(&output_for_thread);
+                    let _ = app_for_thread.emit("video-recording-cancelled", VideoRecordingProblem {
+                        id: id_for_thread.clone(),
+                        message: "Recording cancelled".to_string(),
+                    });
+                } else if let Err(error) = result {
+                    let _ = fs::remove_file(&output_for_thread);
+                    let _ = app_for_thread.emit("video-recording-error", VideoRecordingProblem {
+                        id: id_for_thread.clone(),
+                        message: error,
+                    });
+                } else {
+                    let mut finished = finished;
+                    finished.duration_ms = control.elapsed_ms.load(Ordering::Relaxed).max(1);
+                    let _ = app_for_thread.emit("video-recording-finished", finished);
+                }
+                if let Ok(mut recordings) = video_recordings().lock() {
+                    recordings.remove(&id_for_thread);
+                }
+            })
+            .map_err(|error| format!("Could not start video recording: {error}"))?;
+        Ok(VideoRecordingSession { id })
+    }
+}
+
+#[tauri::command]
+async fn start_video_recording(
+    app: AppHandle,
+    request: VideoRecordingRequest,
+) -> Result<VideoRecordingSession, String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_video_recording::start(app, request)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, request);
+        Err("Video recording is currently available on Windows only".to_string())
+    }
+}
+
+fn ffmpeg_candidates(app: &AppHandle) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("ffmpeg.exe"));
+        candidates.push(resource_dir.join("bin").join("ffmpeg.exe"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("ffmpeg.exe"));
+            candidates.push(dir.join("bin").join("ffmpeg.exe"));
+        }
+    }
+    candidates.push(PathBuf::from("ffmpeg"));
+    candidates
+}
+
+fn ffmpeg_binary(app: &AppHandle) -> Option<PathBuf> {
+    ffmpeg_candidates(app)
+        .into_iter()
+        .find(|candidate| candidate == Path::new("ffmpeg") || candidate.exists())
+}
+
+#[tauri::command]
+async fn export_video_gif(
+    app: AppHandle,
+    source_path: String,
+    duration_ms: u64,
+) -> Result<GifExportResult, String> {
+    if duration_ms > 15_000 {
+        return Err("GIF export is only available for videos up to 15 seconds".to_string());
+    }
+    let source = validated_app_data_file_path(&app, &source_path)?;
+    if source.extension().and_then(|ext| ext.to_str()) != Some("mp4") {
+        return Err("GIF export expects a local MP4 recording".to_string());
+    }
+    let output = source.with_extension("gif");
+    let ffmpeg = ffmpeg_binary(&app).ok_or_else(|| {
+        "FFmpeg was not found. Bundle ffmpeg.exe beside the app to enable GIF export.".to_string()
+    })?;
+    let status = Command::new(ffmpeg)
+        .arg("-y")
+        .arg("-i")
+        .arg(&source)
+        .arg("-vf")
+        .arg("fps=12,scale=iw:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse")
+        .arg(&output)
+        .status()
+        .map_err(|error| format!("Could not start FFmpeg: {error}"))?;
+    if !status.success() {
+        return Err("FFmpeg could not export this recording as GIF".to_string());
+    }
+    Ok(GifExportResult {
+        file_path: output.to_string_lossy().to_string(),
+    })
+}
+
 /// Keeps the capture overlay predictable across Windows compositors. The
 /// layered style and tiny complex region avoid several Chromium/window-manager
 /// occlusion edge cases, and are harmless now that normal area capture crops a
@@ -2313,16 +3304,35 @@ async fn list_local_captures(
     entries.sort_by(|a, b| b.0.cmp(&a.0));
     let mut records = Vec::new();
     for (_, json_path) in entries.into_iter().take(limit.clamp(1, 200)) {
-        let png_path = json_path.with_extension("png");
-        if !png_path.exists() {
-            continue;
-        }
         let Ok(metadata_json) = fs::read_to_string(&json_path) else {
             continue;
         };
+        let media_kind = serde_json::from_str::<serde_json::Value>(&metadata_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("mediaKind")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "image".to_string());
+        let preferred_path =
+            json_path.with_extension(media_extension(normalized_media_kind(Some(&media_kind))));
+        let file_path = if preferred_path.exists() {
+            preferred_path
+        } else {
+            ["png", "mp4"]
+                .into_iter()
+                .map(|extension| json_path.with_extension(extension))
+                .find(|candidate| candidate.exists())
+                .unwrap_or_else(|| json_path.with_extension("png"))
+        };
+        if !file_path.exists() {
+            continue;
+        }
         records.push(LocalCaptureRecord {
             metadata_json,
-            file_path: png_path.to_string_lossy().to_string(),
+            file_path: file_path.to_string_lossy().to_string(),
         });
     }
     Ok(records)
@@ -2544,10 +3554,17 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             save_pending_capture,
+            save_pending_capture_file,
             read_pending_capture,
+            pending_capture_file_info,
             read_local_capture,
+            capture_file_info,
+            read_capture_file_chunk,
+            sha256_capture_file,
+            delete_capture_file,
             delete_pending_capture,
             save_local_capture,
+            save_local_capture_file,
             overwrite_local_capture,
             list_local_captures,
             launched_hidden,
@@ -2567,6 +3584,13 @@ pub fn run() {
             finish_area_capture,
             finish_area_capture_from_snapshot,
             native_area_capture,
+            select_area_region,
+            start_video_recording,
+            set_video_recording_paused,
+            set_video_recording_audio_muted,
+            stop_video_recording,
+            cancel_video_recording,
+            export_video_gif,
             prepare_overlay_window,
             copy_png_to_clipboard,
             platform_label,

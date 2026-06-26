@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { emitTo, listen } from '@tauri-apps/api/event';
 import { currentMonitor, cursorPosition, getCurrentWindow, LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -18,25 +18,34 @@ import {
   Copy,
   Crosshair,
   Download,
+  FileVideo,
   History,
   Image as ImageIcon,
   Link,
+  Maximize2,
   MoreVertical,
   Minus,
   PanelLeftClose,
   PanelLeftOpen,
   RefreshCw,
   Settings,
+  Pause,
+  Play,
+  Square,
   UploadCloud,
   Users,
   ShieldCheck,
+  Video,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import './styles.css';
 
 type CaptureMode = 'area' | 'fullscreen';
+type CaptureMediaKind = 'image' | 'video';
 type AppTab = 'capture' | 'history' | 'queue' | 'settings';
-type ShortcutField = 'areaShortcut' | 'fullscreenShortcut';
+type ShortcutField = 'areaShortcut' | 'fullscreenShortcut' | 'videoAreaShortcut' | 'videoFullscreenShortcut';
 type CaptureDestination = 'local' | 'dendroApi' | 'googleDrive';
 type UploadDestination = 'dendroApi' | 'googleDrive';
 type SettingsSection = 'destination' | 'local' | 'dendroApi' | 'googleDrive' | 'capture';
@@ -81,8 +90,12 @@ interface CaptureSettings {
   apiBaseUrl: string;
   areaShortcut: string;
   fullscreenShortcut: string;
+  videoAreaShortcut: string;
+  videoFullscreenShortcut: string;
   qualityScale: number;
   delayedAreaCaptureSeconds: number;
+  videoDurationSeconds: number;
+  videoSystemAudio: boolean;
   deviceName: string;
   captureDestination: CaptureDestination;
   apiSendingEnabled: boolean;
@@ -100,15 +113,21 @@ interface CaptureSettings {
 interface PendingCapture {
   id: string;
   mode: CaptureMode;
+  mediaKind?: CaptureMediaKind;
+  mimeType?: string;
   capturedAt: string;
   width: number;
   height: number;
   displayWidth: number;
   displayHeight: number;
   scaleFactor: number;
+  durationMs?: number;
+  frameRate?: number;
+  hasAudio?: boolean;
   appName?: string;
   windowTitle?: string;
   previewBase64?: string;
+  filePath?: string;
   destination?: UploadDestination;
   assetUrl?: string;
   googleDriveFileId?: string;
@@ -156,6 +175,50 @@ interface GoogleDriveUploadResult {
   webViewLink?: string | null;
   folderViewLink?: string | null;
   ocrIndexed: boolean;
+}
+
+interface CaptureFileInfo {
+  filePath: string;
+  size: number;
+}
+
+interface CaptureFileChunk {
+  bytesBase64: string;
+  bytesRead: number;
+}
+
+interface VideoRecordingFinished {
+  id: string;
+  filePath: string;
+  width: number;
+  height: number;
+  displayWidth: number;
+  displayHeight: number;
+  scaleFactor: number;
+  originX: number;
+  originY: number;
+  durationMs: number;
+  frameRate: number;
+  hasAudio: boolean;
+  thumbnailBase64?: string | null;
+}
+
+interface VideoRecordingProblem {
+  id: string;
+  message: string;
+}
+
+interface GifExportResult {
+  filePath: string;
+}
+
+interface RecordingState {
+  id: string;
+  mode: CaptureMode;
+  startedAt: string;
+  paused: boolean;
+  durationMs: number;
+  hasAudio: boolean;
 }
 
 interface GoogleDriveOcrUpdateResult {
@@ -214,8 +277,14 @@ const MIN_APP_WIDTH = 820;
 const MIN_APP_HEIGHT = 500;
 const MAX_APP_WIDTH = 1120;
 const MAX_APP_HEIGHT = 720;
+const MEDIA_FULLSCREEN_CLASS = 'dc-media-fullscreen-active';
 const DEFAULT_AREA_SHORTCUT = 'Ctrl+Alt+C';
 const OLD_DEFAULT_AREA_SHORTCUT = 'Alt+Shift+4';
+const DEFAULT_VIDEO_AREA_SHORTCUT = 'Ctrl+Alt+V';
+const DEFAULT_VIDEO_FULLSCREEN_SHORTCUT = 'Alt+Shift+6';
+const VIDEO_FRAME_RATE = 30;
+const MAX_VIDEO_DURATION_SECONDS = 120;
+const GIF_EXPORT_MAX_DURATION_MS = 15_000;
 const GOOGLE_DRIVE_API_CONSOLE_URL = 'https://console.cloud.google.com/apis/library/drive.googleapis.com';
 const GOOGLE_AUTH_CLIENTS_URL = 'https://console.cloud.google.com/auth/clients';
 const GOOGLE_AUTH_AUDIENCE_URL = 'https://console.cloud.google.com/auth/audience';
@@ -226,15 +295,19 @@ const defaultSettings: CaptureSettings = {
   apiBaseUrl: 'http://localhost:3001/api',
   areaShortcut: DEFAULT_AREA_SHORTCUT,
   fullscreenShortcut: 'Alt+Shift+5',
+  videoAreaShortcut: DEFAULT_VIDEO_AREA_SHORTCUT,
+  videoFullscreenShortcut: DEFAULT_VIDEO_FULLSCREEN_SHORTCUT,
   qualityScale: 1,
   delayedAreaCaptureSeconds: 2,
+  videoDurationSeconds: 10,
+  videoSystemAudio: false,
   deviceName: 'DendroCapture Desktop',
   captureDestination: 'local',
   apiSendingEnabled: true,
   openAfterUpload: false,
   hideDuringCapture: true,
   liveAreaSelection: true,
-  saveLocally: true,
+  saveLocally: false,
   googleDriveUploadEnabled: false,
   googleDriveOcrEnabled: true,
   googleDriveClientId: '',
@@ -314,6 +387,9 @@ const loadSettings = (): CaptureSettings => {
   const delayedAreaCaptureSeconds = typeof raw.delayedAreaCaptureSeconds === 'number' && Number.isFinite(raw.delayedAreaCaptureSeconds)
     ? clampNumber(raw.delayedAreaCaptureSeconds, 0, 10)
     : defaultSettings.delayedAreaCaptureSeconds;
+  const videoDurationSeconds = typeof raw.videoDurationSeconds === 'number' && Number.isFinite(raw.videoDurationSeconds)
+    ? clampNumber(raw.videoDurationSeconds, 1, MAX_VIDEO_DURATION_SECONDS)
+    : defaultSettings.videoDurationSeconds;
   const liveSelectionDefaultApplied = localStorage.getItem(LIVE_SELECTION_DEFAULT_KEY) === '1';
   const liveAreaSelection = typeof raw.liveAreaSelection === 'boolean'
     ? (liveSelectionDefaultApplied ? raw.liveAreaSelection : true)
@@ -334,8 +410,12 @@ const loadSettings = (): CaptureSettings => {
     apiBaseUrl: str(raw.apiBaseUrl, defaultSettings.apiBaseUrl),
     areaShortcut: str(raw.areaShortcut, defaultSettings.areaShortcut),
     fullscreenShortcut: str(raw.fullscreenShortcut, defaultSettings.fullscreenShortcut),
+    videoAreaShortcut: str(raw.videoAreaShortcut, defaultSettings.videoAreaShortcut),
+    videoFullscreenShortcut: str(raw.videoFullscreenShortcut, defaultSettings.videoFullscreenShortcut),
     qualityScale,
     delayedAreaCaptureSeconds,
+    videoDurationSeconds,
+    videoSystemAudio: bool(raw.videoSystemAudio, defaultSettings.videoSystemAudio),
     deviceName: str(raw.deviceName, defaultSettings.deviceName),
     captureDestination,
     apiSendingEnabled: bool(raw.apiSendingEnabled, defaultSettings.apiSendingEnabled),
@@ -370,7 +450,39 @@ const sha256Hex = async (bytes: Uint8Array): Promise<string> => {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 };
 
-const dataUrl = (base64: string): string => `data:image/png;base64,${base64}`;
+const fileNameFromPath = (path?: string): string | undefined =>
+  path?.split(/[\\/]/).pop() || undefined;
+
+const dataUrl = (base64: string, mimeType = 'image/png'): string => `data:${mimeType};base64,${base64}`;
+
+const mediaKindForCapture = (capture?: Pick<PendingCapture, 'mediaKind'> | null): CaptureMediaKind =>
+  capture?.mediaKind === 'video' ? 'video' : 'image';
+
+const isVideoCapture = (capture?: Pick<PendingCapture, 'mediaKind'> | null): boolean =>
+  mediaKindForCapture(capture) === 'video';
+
+const mimeTypeForCapture = (capture?: Pick<PendingCapture, 'mediaKind' | 'mimeType'> | null): string =>
+  capture?.mimeType || (isVideoCapture(capture) ? 'video/mp4' : 'image/png');
+
+const mediaExtension = (mediaKind: CaptureMediaKind): string =>
+  mediaKind === 'video' ? 'mp4' : 'png';
+
+const durationLabel = (durationMs?: number): string => {
+  const totalSeconds = Math.max(0, Math.round((durationMs || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}:${String(seconds).padStart(2, '0')}` : `${seconds}s`;
+};
+
+const mediaTimeLabel = (secondsValue?: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(Number.isFinite(secondsValue || 0) ? secondsValue || 0 : 0));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+};
+
+const isMediaFullscreenActive = (): boolean =>
+  Boolean(document.fullscreenElement) || document.body.classList.contains(MEDIA_FULLSCREEN_CLASS);
 
 let ocrWorkerPromise: ReturnType<typeof Tesseract.createWorker> | null = null;
 
@@ -425,21 +537,28 @@ const loadPendingQueue = (): PendingCapture[] =>
     .filter((item) => typeof item.id === 'string' && typeof item.mode === 'string' && !item.pngBase64)
     .map((item) => {
       const mode: CaptureMode = item.mode === 'fullscreen' ? 'fullscreen' : 'area';
+      const mediaKind: CaptureMediaKind = item.mediaKind === 'video' ? 'video' : 'image';
       const destination: UploadDestination = item.destination === 'googleDrive' ? 'googleDrive' : 'dendroApi';
       return {
         id: String(item.id),
         mode,
+        mediaKind,
+        mimeType: typeof item.mimeType === 'string' ? item.mimeType : (mediaKind === 'video' ? 'video/mp4' : 'image/png'),
         capturedAt: typeof item.capturedAt === 'string' ? item.capturedAt : new Date().toISOString(),
         width: Number(item.width) || 0,
         height: Number(item.height) || 0,
         displayWidth: Number(item.displayWidth) || Number(item.width) || 0,
         displayHeight: Number(item.displayHeight) || Number(item.height) || 0,
         scaleFactor: Number(item.scaleFactor) || 1,
+        durationMs: Number(item.durationMs) || undefined,
+        frameRate: Number(item.frameRate) || undefined,
+        hasAudio: typeof item.hasAudio === 'boolean' ? item.hasAudio : undefined,
         appName: typeof item.appName === 'string' ? item.appName : undefined,
         windowTitle: typeof item.windowTitle === 'string' ? item.windowTitle : undefined,
         previewBase64: typeof item.previewBase64 === 'string' && item.previewBase64.length < 300_000
           ? item.previewBase64
           : undefined,
+        filePath: typeof item.filePath === 'string' ? item.filePath : undefined,
         destination,
         assetUrl: typeof item.assetUrl === 'string' ? item.assetUrl : undefined,
         googleDriveFileId: typeof item.googleDriveFileId === 'string' ? item.googleDriveFileId : undefined,
@@ -466,7 +585,13 @@ const normalizedShortcut = (value: string): string =>
     .join('+');
 
 const shortcutTitle = (field: ShortcutField): string =>
-  field === 'areaShortcut' ? 'Capture Area' : 'Capture Fullscreen';
+  field === 'areaShortcut'
+    ? 'Capture Area'
+    : field === 'fullscreenShortcut'
+      ? 'Capture Fullscreen'
+      : field === 'videoAreaShortcut'
+        ? 'Record Area'
+        : 'Record Fullscreen';
 
 const shortcutBaseKey = (event: KeyboardEvent): string | null => {
   if (['Alt', 'Control', 'Shift', 'Meta'].includes(event.key)) return null;
@@ -515,6 +640,7 @@ const shortcutFromKeyboardEvent = (event: KeyboardEvent): string | null => {
 
 type CaptureFileSource = {
   mode?: CaptureMode;
+  mediaKind?: CaptureMediaKind;
   appName?: string | null;
   windowTitle?: string | null;
   width?: number | null;
@@ -544,7 +670,8 @@ const captureFileName = (date: Date, source?: CaptureFileSource): string => {
   const dimensions = source?.width && source?.height ? `${source.width}x${source.height}` : '';
   const fallback = dimensions || (source?.mode === 'fullscreen' ? 'fullscreen' : source?.mode === 'area' ? 'area' : 'capture');
   const sourceName = slugForFileName(source?.appName, fallback);
-  return `dendrocapture-${sourceName}-${timestamp}.png`;
+  const extension = mediaExtension(source?.mediaKind === 'video' ? 'video' : 'image');
+  return `dendrocapture-${sourceName}-${timestamp}.${extension}`;
 };
 
 const captureDayFolderName = (date: Date): string => {
@@ -888,6 +1015,249 @@ const CaptureOverlayApp = () => {
   );
 };
 
+const RecordingControlsApp = () => {
+  const params = new URLSearchParams(window.location.search);
+  const id = params.get('recordingId') || '';
+  const mode = params.get('mode') === 'fullscreen' ? 'fullscreen' : 'area';
+  const durationMs = clampNumber(Number(params.get('durationMs')) || 10_000, 1_000, 120_000);
+  const hasAudio = params.get('hasAudio') === '1';
+  const [paused, setPaused] = useState(false);
+  const [audioMuted, setAudioMuted] = useState(!hasAudio);
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  useEffect(() => {
+    document.documentElement.classList.add('dc-recording-controls-page');
+    document.body.classList.add('dc-recording-controls-body');
+    const win = getCurrentWindow();
+    void win.setAlwaysOnTop(true).catch(() => undefined);
+    void win.setContentProtected(true).catch(() => undefined);
+    const timer = window.setInterval(() => {
+      if (!paused) setElapsedMs((current) => Math.min(durationMs, current + 250));
+    }, 250);
+    const subscriptions = [
+      listen<VideoRecordingFinished>('video-recording-finished', (event) => {
+        if (event.payload.id === id) void win.close().catch(() => undefined);
+      }),
+      listen<VideoRecordingProblem>('video-recording-cancelled', (event) => {
+        if (event.payload.id === id) void win.close().catch(() => undefined);
+      }),
+      listen<VideoRecordingProblem>('video-recording-error', (event) => {
+        if (event.payload.id === id) void win.close().catch(() => undefined);
+      }),
+    ];
+    return () => {
+      window.clearInterval(timer);
+      subscriptions.forEach((subscription) => {
+        void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+      });
+      document.documentElement.classList.remove('dc-recording-controls-page');
+      document.body.classList.remove('dc-recording-controls-body');
+    };
+  }, [durationMs, id, paused]);
+
+  const togglePause = async () => {
+    const next = !paused;
+    setPaused(next);
+    await invoke('set_video_recording_paused', { id, paused: next }).catch(() => undefined);
+  };
+
+  const toggleAudioMuted = async () => {
+    if (!hasAudio) return;
+    const next = !audioMuted;
+    setAudioMuted(next);
+    await invoke('set_video_recording_audio_muted', { id, muted: next }).catch(() => undefined);
+  };
+
+  const stop = async () => {
+    await invoke('stop_video_recording', { id }).catch(() => undefined);
+  };
+
+  const cancel = async () => {
+    await invoke('cancel_video_recording', { id }).catch(() => undefined);
+    await getCurrentWindow().close().catch(() => undefined);
+  };
+
+  const remainingMs = Math.max(0, durationMs - elapsedMs);
+  return (
+    <div className="dc-recording-controls">
+      <div className="dc-recording-dot" />
+      <span className="dc-recording-copy">
+        <strong>{paused ? 'Paused' : mode === 'fullscreen' ? 'Recording Fullscreen' : 'Recording Area'}</strong>
+        <small>{durationLabel(elapsedMs)} / {durationLabel(durationMs)} - {durationLabel(remainingMs)} left</small>
+      </span>
+      <button
+        type="button"
+        className={`dc-recording-audio${hasAudio && !audioMuted ? ' on' : ' off'}`}
+        onClick={() => void toggleAudioMuted()}
+        disabled={!hasAudio}
+        title={hasAudio ? (audioMuted ? 'Unmute system audio' : 'Mute system audio') : 'System audio was off when recording started'}
+      >
+        {hasAudio && !audioMuted ? <Volume2 size={14} /> : <VolumeX size={14} />}
+      </button>
+      <button type="button" onClick={() => void togglePause()} title={paused ? 'Resume recording' : 'Pause recording'}>
+        {paused ? <Play size={16} /> : <Pause size={16} />}
+      </button>
+      <button type="button" onClick={() => void stop()} title="Stop and save">
+        <Square size={15} />
+      </button>
+      <button type="button" className="danger" onClick={() => void cancel()} title="Cancel and delete">
+        <X size={16} />
+      </button>
+    </div>
+  );
+};
+
+interface PreviewVideoPlayerProps {
+  src: string;
+  poster?: string;
+}
+
+const PreviewVideoPlayer = ({ src, poster }: PreviewVideoPlayerProps) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const playerRef = useRef<HTMLDivElement | null>(null);
+  const [paused, setPaused] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return undefined;
+
+    const syncMetadata = () => {
+      setDuration(Number.isFinite(video.duration) ? video.duration : 0);
+      setCurrentTime(Number.isFinite(video.currentTime) ? video.currentTime : 0);
+      setMuted(video.muted);
+      setPaused(video.paused);
+    };
+    const syncTime = () => setCurrentTime(Number.isFinite(video.currentTime) ? video.currentTime : 0);
+    const syncMuted = () => setMuted(video.muted);
+    const syncPlaying = () => setPaused(false);
+    const syncPaused = () => setPaused(true);
+
+    syncMetadata();
+    video.addEventListener('loadedmetadata', syncMetadata);
+    video.addEventListener('durationchange', syncMetadata);
+    video.addEventListener('timeupdate', syncTime);
+    video.addEventListener('volumechange', syncMuted);
+    video.addEventListener('play', syncPlaying);
+    video.addEventListener('pause', syncPaused);
+    video.addEventListener('ended', syncPaused);
+
+    return () => {
+      video.removeEventListener('loadedmetadata', syncMetadata);
+      video.removeEventListener('durationchange', syncMetadata);
+      video.removeEventListener('timeupdate', syncTime);
+      video.removeEventListener('volumechange', syncMuted);
+      video.removeEventListener('play', syncPlaying);
+      video.removeEventListener('pause', syncPaused);
+      video.removeEventListener('ended', syncPaused);
+    };
+  }, [src]);
+
+  const togglePlay = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) {
+      await video.play().catch(() => undefined);
+    } else {
+      video.pause();
+    }
+  };
+
+  const seek = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const nextTime = Number(event.currentTarget.value);
+    video.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  };
+
+  const toggleMute = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setMuted(video.muted);
+  };
+
+  const enterFullscreen = async () => {
+    const player = playerRef.current;
+    if (!player) return;
+    if (document.fullscreenElement) {
+      await document.exitFullscreen?.().catch(() => undefined);
+      return;
+    }
+    document.body.classList.add(MEDIA_FULLSCREEN_CLASS);
+    await player.requestFullscreen?.().catch(() => {
+      if (!document.fullscreenElement) document.body.classList.remove(MEDIA_FULLSCREEN_CLASS);
+    });
+  };
+
+  const boundedTime = duration > 0 ? Math.min(currentTime, duration) : 0;
+  const progress = duration > 0 ? `${Math.min(100, Math.max(0, (boundedTime / duration) * 100))}%` : '0%';
+
+  return (
+    <div className="dc-media-player" ref={playerRef}>
+      <video
+        ref={videoRef}
+        className="dc-media-video"
+        src={src}
+        playsInline
+        preload="metadata"
+        poster={poster}
+        onClick={() => void togglePlay()}
+      />
+      <button
+        type="button"
+        className={`dc-media-center-button${paused ? ' visible' : ''}`}
+        onClick={() => void togglePlay()}
+        aria-label={paused ? 'Play video preview' : 'Pause video preview'}
+      >
+        {paused ? <Play size={24} /> : <Pause size={24} />}
+      </button>
+      <div className="dc-media-controls">
+        <button
+          type="button"
+          className="dc-media-button primary"
+          onClick={() => void togglePlay()}
+          aria-label={paused ? 'Play video preview' : 'Pause video preview'}
+        >
+          {paused ? <Play size={16} /> : <Pause size={16} />}
+        </button>
+        <span className="dc-media-time">{mediaTimeLabel(boundedTime)} / {mediaTimeLabel(duration)}</span>
+        <input
+          className="dc-media-progress"
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={0.05}
+          value={boundedTime}
+          onChange={seek}
+          disabled={!duration}
+          aria-label="Video preview position"
+          style={{ '--dc-progress': progress } as React.CSSProperties}
+        />
+        <button
+          type="button"
+          className="dc-media-button"
+          onClick={toggleMute}
+          aria-label={muted ? 'Unmute video preview' : 'Mute video preview'}
+        >
+          {muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+        </button>
+        <button
+          type="button"
+          className="dc-media-button"
+          onClick={() => void enterFullscreen()}
+          aria-label="Fullscreen video preview"
+        >
+          <Maximize2 size={16} />
+        </button>
+      </div>
+    </div>
+  );
+};
+
 class BootErrorBoundary extends React.Component<{ children: React.ReactNode }, { error: Error | null }> {
   state: { error: Error | null } = { error: null };
 
@@ -931,9 +1301,11 @@ const DendroCaptureApp = () => {
   const [lastCaptureImage, setLastCaptureImage] = useState<string | null>(null);
   const [editingCapture, setEditingCapture] = useState<EditingCapture | null>(null);
   const [recordingShortcut, setRecordingShortcut] = useState<ShortcutField | null>(null);
+  const [recording, setRecording] = useState<RecordingState | null>(null);
   const [previewMenuOpen, setPreviewMenuOpen] = useState(false);
   const [fullscreenPicker, setFullscreenPicker] = useState<{
     loading: boolean;
+    purpose: 'image' | 'video';
     previews: MonitorPreview[];
     error?: string;
   } | null>(null);
@@ -953,11 +1325,13 @@ const DendroCaptureApp = () => {
   const googleDriveLinkAttemptRef = useRef(0);
   const activeCaptureContextRef = useRef<CaptureWindowContext | null>(null);
   const lastExternalContextRef = useRef<CaptureWindowContext | null>(null);
+  const transientPreviewFileRef = useRef<{ id: string; filePath: string } | null>(null);
   const processCaptureRef = useRef<(
     mode: CaptureMode,
     capture: NativeCapture,
     context?: CaptureWindowContext | null
   ) => Promise<void>>(async () => undefined);
+  const recordingContextRef = useRef<Record<string, { mode: CaptureMode; startedAt: string; context: CaptureWindowContext | null }>>({});
 
   useEffect(() => {
     const prepareTrayStartup = async () => {
@@ -974,8 +1348,12 @@ const DendroCaptureApp = () => {
   }, []);
 
   const fitWindowToCurrentMonitor = useCallback(async () => {
+    if (isMediaFullscreenActive()) return;
     const win = getCurrentWindow();
+    const isWindowFullscreen = await win.isFullscreen().catch(() => false);
+    if (isWindowFullscreen || isMediaFullscreenActive()) return;
     const monitor = await currentMonitor().catch(() => null);
+    if (isMediaFullscreenActive()) return;
     const scaleFactor = monitor?.scaleFactor || 1;
     const workWidth = monitor ? monitor.workArea.size.width / scaleFactor : 1440;
     const workHeight = monitor ? monitor.workArea.size.height / scaleFactor : 900;
@@ -1002,9 +1380,33 @@ const DendroCaptureApp = () => {
     editingCaptureRef.current = isEditing;
     // Annotating a capture inside the compact app window is cramped; grow to
     // most of the work area while the editor is open and shrink back after.
+    if (isMediaFullscreenActive()) return;
     if (isEditing) void enlargeWindowForEditor();
     else void fitWindowToCurrentMonitor();
   }, [!!editingCapture, enlargeWindowForEditor, fitWindowToCurrentMonitor]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      const isFullscreen = Boolean(document.fullscreenElement);
+      document.body.classList.toggle(MEDIA_FULLSCREEN_CLASS, isFullscreen);
+      if (fitWindowTimerRef.current !== null) {
+        window.clearTimeout(fitWindowTimerRef.current);
+        fitWindowTimerRef.current = null;
+      }
+      if (!isFullscreen && !editingCaptureRef.current) {
+        fitWindowTimerRef.current = window.setTimeout(() => {
+          fitWindowTimerRef.current = null;
+          if (!isMediaFullscreenActive() && !editingCaptureRef.current) void fitWindowToCurrentMonitor();
+        }, 260);
+      }
+    };
+
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.body.classList.remove(MEDIA_FULLSCREEN_CLASS);
+    };
+  }, [fitWindowToCurrentMonitor]);
 
   useEffect(() => {
     const win = getCurrentWindow();
@@ -1015,12 +1417,12 @@ const DendroCaptureApp = () => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
       fitWindowTimerRef.current = window.setTimeout(() => {
         fitWindowTimerRef.current = null;
-        if (editingCaptureRef.current) return;
+        if (editingCaptureRef.current || isMediaFullscreenActive()) return;
         void fitWindowToCurrentMonitor();
       }, 520);
     };
 
-    void fitWindowToCurrentMonitor();
+    if (!isMediaFullscreenActive()) void fitWindowToCurrentMonitor();
     void win.onMoved(() => scheduleFit()).then((unlisten) => {
       unlistenMoved = unlisten;
     }).catch(() => undefined);
@@ -1109,15 +1511,21 @@ const DendroCaptureApp = () => {
           try {
             const meta = JSON.parse(record.metadataJson) as Partial<LocalCapture>;
             if (typeof meta.id !== 'string' || typeof meta.capturedAt !== 'string') continue;
+            const mediaKind: CaptureMediaKind = meta.mediaKind === 'video' ? 'video' : 'image';
             restored.push({
               id: meta.id,
               mode: meta.mode === 'fullscreen' ? 'fullscreen' : 'area',
+              mediaKind,
+              mimeType: typeof meta.mimeType === 'string' ? meta.mimeType : (mediaKind === 'video' ? 'video/mp4' : 'image/png'),
               capturedAt: meta.capturedAt,
               width: Number(meta.width) || 0,
               height: Number(meta.height) || 0,
               displayWidth: Number(meta.displayWidth) || Number(meta.width) || 0,
               displayHeight: Number(meta.displayHeight) || Number(meta.height) || 0,
               scaleFactor: Number(meta.scaleFactor) || 1,
+              durationMs: Number(meta.durationMs) || undefined,
+              frameRate: Number(meta.frameRate) || undefined,
+              hasAudio: typeof meta.hasAudio === 'boolean' ? meta.hasAudio : undefined,
               appName: typeof meta.appName === 'string' ? meta.appName : undefined,
               windowTitle: typeof meta.windowTitle === 'string' ? meta.windowTitle : undefined,
               previewBase64: typeof meta.previewBase64 === 'string' ? meta.previewBase64 : undefined,
@@ -1188,7 +1596,6 @@ const DendroCaptureApp = () => {
     setSettings((current) => ({
       ...current,
       captureDestination: destination,
-      saveLocally: destination === 'local' ? true : current.saveLocally,
       apiSendingEnabled: destination === 'dendroApi' ? true : current.apiSendingEnabled,
       googleDriveUploadEnabled: destination === 'googleDrive',
     }));
@@ -1290,10 +1697,13 @@ const DendroCaptureApp = () => {
     const shortcut = normalizedShortcut(value);
     if (!shortcut) return false;
 
-    const otherField: ShortcutField = field === 'areaShortcut' ? 'fullscreenShortcut' : 'areaShortcut';
-    if (normalizedShortcut(settingsRef.current[otherField]).toLowerCase() === shortcut.toLowerCase()) {
-      setStatus(`${shortcut} is already used by ${shortcutTitle(otherField)}`);
-      return false;
+    const shortcutFields: ShortcutField[] = ['areaShortcut', 'fullscreenShortcut', 'videoAreaShortcut', 'videoFullscreenShortcut'];
+    for (const otherField of shortcutFields) {
+      if (otherField === field) continue;
+      if (normalizedShortcut(settingsRef.current[otherField]).toLowerCase() === shortcut.toLowerCase()) {
+        setStatus(`${shortcut} is already used by ${shortcutTitle(otherField)}`);
+        return false;
+      }
     }
 
     setSettings((current) => ({ ...current, [field]: shortcut }));
@@ -1369,8 +1779,13 @@ const DendroCaptureApp = () => {
       });
       const next = { deviceId: result.deviceId, publicKey: key.publicKey };
       setDevice(next);
+      updateSettings({
+        captureDestination: 'dendroApi',
+        apiSendingEnabled: true,
+        saveLocally: false,
+      });
       setPairingCode('');
-      setStatus('Device paired');
+      setStatus('Device paired. Captures will upload to Dendro API without saving local copies.');
     } catch (error) {
       setStatus(errorMessage(error, 'Pairing failed'));
     } finally {
@@ -1447,6 +1862,42 @@ const DendroCaptureApp = () => {
     setLocalCaptures((current) => current.map((item) => (item.id === capture.id ? { ...item, ...capture } : item)));
   };
 
+  const isTransientPreviewCapture = (capture?: Pick<LocalCapture, 'id' | 'filePath'> | null): boolean =>
+    Boolean(
+      capture?.filePath
+      && transientPreviewFileRef.current?.id === capture.id
+      && transientPreviewFileRef.current.filePath === capture.filePath
+    );
+
+  const deleteTransientCaptureFile = async (
+    capture: LocalCapture,
+    options?: { preservePreview?: boolean },
+  ): Promise<LocalCapture> => {
+    if (!capture.filePath || settingsRef.current.saveLocally) return capture;
+    const isSavedHistoryFile = localCaptures.some((item) => item.id === capture.id && item.filePath === capture.filePath);
+    if (isSavedHistoryFile) return capture;
+    if (options?.preservePreview) {
+      const previous = transientPreviewFileRef.current;
+      if (previous && (previous.id !== capture.id || previous.filePath !== capture.filePath)) {
+        await invoke('delete_capture_file', { path: previous.filePath }).catch((error) => {
+          console.warn('Could not delete previous transient preview file', error);
+        });
+      }
+      transientPreviewFileRef.current = { id: capture.id, filePath: capture.filePath };
+      return capture;
+    }
+    await invoke('delete_capture_file', { path: capture.filePath }).catch((error) => {
+      console.warn('Could not delete transient capture file', error);
+    });
+    if (transientPreviewFileRef.current?.filePath === capture.filePath) {
+      transientPreviewFileRef.current = null;
+    }
+    const withoutFile = { ...capture, filePath: undefined };
+    setLastCapture((current) => (current?.id === capture.id ? { ...current, filePath: undefined } : current));
+    setPending((current) => current.map((item) => (item.id === capture.id ? { ...item, filePath: undefined } : item)));
+    return withoutFile;
+  };
+
   const metadataForCapture = (capture: LocalCapture, sourceName: string, operationCount?: number) =>
     JSON.stringify({
       ...capture,
@@ -1457,6 +1908,10 @@ const DendroCaptureApp = () => {
     });
 
   const openDrawEditor = async (capture: LocalCapture, source: EditingCaptureSource) => {
+    if (isVideoCapture(capture)) {
+      setStatus('Video recordings cannot be opened in the image editor');
+      return;
+    }
     setStatus('Loading capture editor');
     try {
       let imageBase64: string | undefined;
@@ -1483,6 +1938,7 @@ const DendroCaptureApp = () => {
   };
 
   const originalPngForCapture = async (capture: LocalCapture): Promise<string> => {
+    if (isVideoCapture(capture)) throw new Error('Video recordings do not have PNG image data');
     if (lastCapture?.id === capture.id && lastCaptureImage) return lastCaptureImage;
     if (capture.filePath) return invoke<string>('read_local_capture', { path: capture.filePath });
     return invoke<string>('read_pending_capture', { id: capture.id });
@@ -1614,11 +2070,31 @@ const DendroCaptureApp = () => {
     };
 
     const token = await uploadStep('Authorize upload', captureToken);
-    const pngBase64 = capture.pngBase64 || await uploadStep(
-      'Read queued capture',
-      () => invoke<string>('read_pending_capture', { id: capture.id })
-    );
-    const bytes = base64ToBytes(pngBase64);
+    const mediaKind = mediaKindForCapture(capture);
+    const mimeType = mimeTypeForCapture(capture);
+    let bytes: Uint8Array | null = null;
+    let filePath = capture.filePath;
+    let expectedSize = 0;
+    if (mediaKind === 'video') {
+      if (!filePath) {
+        const pendingFile = await uploadStep('Read queued recording file', () =>
+          invoke<CaptureFileInfo>('pending_capture_file_info', { id: capture.id, mediaKind: 'video' })
+        );
+        filePath = pendingFile.filePath;
+      }
+      const info = await uploadStep('Read recording file', () =>
+        invoke<CaptureFileInfo>('capture_file_info', { path: filePath })
+      );
+      filePath = info.filePath;
+      expectedSize = info.size;
+    } else {
+      const pngBase64 = capture.pngBase64 || await uploadStep(
+        'Read queued capture',
+        () => invoke<string>('read_pending_capture', { id: capture.id })
+      );
+      bytes = base64ToBytes(pngBase64);
+      expectedSize = bytes.byteLength;
+    }
     const platform = await platformLabel();
     const sourceName = captureFileName(new Date(capture.capturedAt), capture);
     const appName = capture.appName?.trim();
@@ -1631,7 +2107,12 @@ const DendroCaptureApp = () => {
         chunkSize: number;
       }>('/capture/assets/uploads', {
         sourceName,
-        expectedSize: bytes.byteLength,
+        expectedSize,
+        mediaKind,
+        mimeType,
+        durationMs: capture.durationMs,
+        frameRate: capture.frameRate,
+        hasAudio: capture.hasAudio,
         capturedAt: capture.capturedAt,
         captureMode: capture.mode,
         width: capture.width,
@@ -1650,10 +2131,25 @@ const DendroCaptureApp = () => {
     );
 
     const chunkSize = upload.chunkSize || CHUNK_SIZE;
-    const totalChunks = Math.max(1, Math.ceil(bytes.byteLength / chunkSize));
-    for (let offset = 0, chunkIndex = 0; offset < bytes.byteLength; offset += chunkSize, chunkIndex += 1) {
+    const totalChunks = Math.max(1, Math.ceil(expectedSize / chunkSize));
+    for (let offset = 0, chunkIndex = 0; offset < expectedSize; chunkIndex += 1) {
       await uploadStep(`Upload chunk ${chunkIndex + 1}/${totalChunks}`, async () => {
-        const chunk = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
+        let chunk: Uint8Array;
+        if (mediaKind === 'video') {
+          if (!filePath) throw new Error('Recording file path is missing');
+          const fileChunk = await invoke<CaptureFileChunk>('read_capture_file_chunk', {
+            path: filePath,
+            offset,
+            length: Math.min(chunkSize, expectedSize - offset),
+          });
+          if (fileChunk.bytesRead <= 0) throw new Error('Recording chunk was empty');
+          chunk = base64ToBytes(fileChunk.bytesBase64);
+          offset += fileChunk.bytesRead;
+        } else {
+          if (!bytes) throw new Error('PNG data is missing');
+          chunk = bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength));
+          offset += chunk.byteLength;
+        }
         let response: Response;
         try {
           response = await fetch(apiUrl(settingsRef.current, `/capture/assets/uploads/${encodeURIComponent(upload.uploadId)}/chunks/${chunkIndex}`), {
@@ -1662,7 +2158,7 @@ const DendroCaptureApp = () => {
               'Content-Type': 'application/octet-stream',
               Authorization: `Bearer ${token}`,
             },
-            body: chunk,
+            body: chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer,
           });
         } catch (error) {
           throw new Error(`Could not reach Dendro API at ${apiBaseLabel(settingsRef.current)} (${errorMessage(error, 'network error')})`);
@@ -1674,7 +2170,12 @@ const DendroCaptureApp = () => {
       });
     }
 
-    const sha256 = await sha256Hex(bytes);
+    const sha256 = mediaKind === 'video'
+      ? await uploadStep('Hash recording', () => {
+        if (!filePath) throw new Error('Recording file path is missing');
+        return invoke<string>('sha256_capture_file', { path: filePath });
+      })
+      : await sha256Hex(bytes!);
     const finalized = await uploadStep('Finalize upload', () =>
       apiPost<{ openUrl?: string }>('/capture/assets/uploads/' + encodeURIComponent(upload.uploadId) + '/finalize', {
         sha256,
@@ -1707,6 +2208,7 @@ const DendroCaptureApp = () => {
     pngBase64: string,
     fileId: string,
   ): Promise<void> => {
+    if (isVideoCapture(capture)) return;
     if (!settingsRef.current.googleDriveOcrEnabled) return;
     try {
       setStatus('Google Drive upload complete, OCR running in background');
@@ -1754,12 +2256,29 @@ const DendroCaptureApp = () => {
       throw new Error('Link Google Drive before uploading captures');
     }
 
-    const pngBase64 = capture.pngBase64 || await invoke<string>('read_pending_capture', { id: capture.id });
-    setStatus('Uploading capture to Google Drive');
+    const mediaKind = mediaKindForCapture(capture);
+    const mimeType = mimeTypeForCapture(capture);
+    let pngBase64: string | undefined;
+    let filePath = capture.filePath;
+    if (mediaKind === 'video') {
+      if (!filePath) {
+        const info = await invoke<CaptureFileInfo>('pending_capture_file_info', { id: capture.id, mediaKind: 'video' });
+        filePath = info.filePath;
+      }
+    } else {
+      pngBase64 = capture.pngBase64 || await invoke<string>('read_pending_capture', { id: capture.id });
+    }
+    setStatus(mediaKind === 'video' ? 'Uploading recording to Google Drive' : 'Uploading capture to Google Drive');
     const result = await invoke<GoogleDriveUploadResult>('google_drive_upload_capture', {
       payload: {
         filename: captureFileName(new Date(capture.capturedAt), capture),
         dayFolderName: captureDayFolderName(new Date(capture.capturedAt)),
+        mediaKind,
+        mimeType,
+        durationMs: capture.durationMs,
+        frameRate: capture.frameRate,
+        hasAudio: capture.hasAudio,
+        filePath,
         pngBase64,
         captureId: capture.id,
         capturedAt: capture.capturedAt,
@@ -1775,7 +2294,7 @@ const DendroCaptureApp = () => {
     });
     removePending(capture.id, 'googleDrive');
     await openOnlineImage(result.webViewLink || result.folderViewLink);
-    void updateGoogleDriveOcrMetadata(capture, pngBase64, result.fileId);
+    if (pngBase64) void updateGoogleDriveOcrMetadata(capture, pngBase64, result.fileId);
     return result;
   };
 
@@ -1785,6 +2304,8 @@ const DendroCaptureApp = () => {
     const item: PendingCapture = {
       id: captureId(now),
       mode,
+      mediaKind: 'image',
+      mimeType: 'image/png',
       capturedAt: now.toISOString(),
       width: capture.width,
       height: capture.height,
@@ -1814,7 +2335,7 @@ const DendroCaptureApp = () => {
     const pairedForUpload = hasPairedDevice(deviceRef.current);
     const canSendToApi = destination === 'dendroApi' && pairedForUpload && settingsRef.current.apiSendingEnabled;
     const canSendToDrive = googleDriveCanUpload();
-    const shouldSaveLocally = destination === 'local' || settingsRef.current.saveLocally;
+    const shouldSaveLocally = settingsRef.current.saveLocally;
     let workingItem: LocalCapture = queuedItem;
     let localSaveError: string | null = null;
     let localSaved = false;
@@ -1919,6 +2440,145 @@ const DendroCaptureApp = () => {
         : '';
     const suffix = warnings.length ? ` (${warnings.join('; ')})` : '';
     setStatus(`${localPrefix}${outcomes.length ? outcomes.join(', ') : 'capture ready'}${suffix}`);
+  };
+
+  const processVideoRecording = async (
+    mode: CaptureMode,
+    recordingResult: VideoRecordingFinished,
+    context?: CaptureWindowContext | null,
+    startedAt?: string,
+  ) => {
+    const capturedAt = startedAt || new Date().toISOString();
+    const cleanContext = cleanCaptureContext(context);
+    const item: PendingCapture = {
+      id: recordingResult.id,
+      mode,
+      mediaKind: 'video',
+      mimeType: 'video/mp4',
+      capturedAt,
+      width: recordingResult.width,
+      height: recordingResult.height,
+      displayWidth: recordingResult.displayWidth,
+      displayHeight: recordingResult.displayHeight,
+      scaleFactor: recordingResult.scaleFactor,
+      durationMs: recordingResult.durationMs,
+      frameRate: recordingResult.frameRate || VIDEO_FRAME_RATE,
+      hasAudio: recordingResult.hasAudio,
+      appName: cleanContext?.appName || undefined,
+      windowTitle: cleanContext?.windowTitle || undefined,
+      previewBase64: recordingResult.thumbnailBase64 || undefined,
+      filePath: recordingResult.filePath,
+    };
+    const sourceName = captureFileName(new Date(capturedAt), item);
+    setLastCaptureImage(null);
+    setLastCapture(item);
+
+    const destination = settingsRef.current.captureDestination;
+    const pairedForUpload = hasPairedDevice(deviceRef.current);
+    const canSendToApi = destination === 'dendroApi' && pairedForUpload && settingsRef.current.apiSendingEnabled;
+    const canSendToDrive = googleDriveCanUpload();
+    const shouldSaveLocally = settingsRef.current.saveLocally;
+    let workingItem: LocalCapture = item;
+    let localSaveError: string | null = null;
+    let localSaved = false;
+
+    if (shouldSaveLocally) {
+      try {
+        const saved = await invoke<LocalCaptureSave>('save_local_capture_file', {
+          filename: sourceName,
+          sourcePath: recordingResult.filePath,
+          mediaKind: 'video',
+          metadataJson: JSON.stringify({
+            ...item,
+            sourceName,
+            appVersion: APP_VERSION,
+          }),
+        });
+        workingItem = { ...item, filePath: saved.filePath };
+        addLocalCapture(workingItem);
+        setLastCapture(workingItem);
+        localSaved = true;
+      } catch (error) {
+        localSaveError = errorMessage(error, 'Unknown error');
+        console.warn('Could not save recording locally', error);
+      }
+    }
+
+    if (!canSendToApi && !canSendToDrive) {
+      if (!shouldSaveLocally) {
+        await deleteTransientCaptureFile(workingItem, { preservePreview: true });
+      }
+      if (localSaveError) {
+        setStatus(`Recording ready, local save failed: ${localSaveError}`);
+      } else if (localSaved) {
+        setStatus(destination === 'dendroApi' && pairedForUpload && !settingsRef.current.apiSendingEnabled ? 'Recording saved locally, API sending blocked' : 'Recording saved locally');
+      } else if (destination === 'dendroApi' && !pairedForUpload) {
+        setStatus('Recording ready. Pair DendroCapture before uploading to Dendro API.');
+      } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
+        setStatus('Recording ready. Link Google Drive before recordings upload there.');
+      } else {
+        setStatus('Recording ready');
+      }
+      return;
+    }
+
+    const persistRetryRecording = async (uploadItem: PendingCapture): Promise<boolean> => {
+      if (!shouldSaveLocally || !uploadItem.filePath) return false;
+      addPending(uploadItem);
+      return true;
+    };
+
+    const outcomes: string[] = [];
+    if (canSendToApi) {
+      const apiItem: PendingCapture = { ...workingItem, destination: 'dendroApi' };
+      const queuedForRetry = await persistRetryRecording(apiItem);
+      setStatus('Uploading recording to Dendro API');
+      try {
+        const uploaded = await uploadCapture(apiItem);
+        if (uploaded.openUrl) {
+          const uploadedItem = { ...workingItem, assetUrl: uploaded.openUrl };
+          workingItem = uploadedItem;
+          setLastCapture(uploadedItem);
+          updateCaptureRecord(uploadedItem);
+        }
+        outcomes.push('uploaded to Dendro API');
+      } catch (error) {
+        outcomes.push(queuedForRetry ? 'queued for Dendro API' : `Dendro API failed: ${errorMessage(error, 'Upload failed')}`);
+      }
+    }
+
+    if (canSendToDrive) {
+      const driveItem: PendingCapture = { ...workingItem, destination: 'googleDrive' };
+      const queuedForRetry = await persistRetryRecording(driveItem);
+      try {
+        const uploaded = await uploadCaptureToGoogleDrive(driveItem);
+        const uploadedItem = {
+          ...workingItem,
+          googleDriveFileId: uploaded.fileId,
+          googleDriveUrl: uploaded.webViewLink || undefined,
+          googleDriveFolderUrl: uploaded.folderViewLink || undefined,
+        };
+        workingItem = uploadedItem;
+        setLastCapture(uploadedItem);
+        updateCaptureRecord(uploadedItem);
+        outcomes.push('uploaded to Google Drive');
+      } catch (error) {
+        outcomes.push(queuedForRetry ? 'queued for Google Drive' : `Google Drive failed: ${errorMessage(error, 'Upload failed')}`);
+      }
+    }
+
+    const localPrefix = localSaveError
+      ? `Local save failed: ${localSaveError}. `
+      : localSaved
+        ? 'Saved locally, '
+        : '';
+    if (!shouldSaveLocally) {
+      workingItem = await deleteTransientCaptureFile(workingItem, { preservePreview: true });
+      if (workingItem.assetUrl || workingItem.googleDriveUrl) {
+        updateCaptureRecord(workingItem);
+      }
+    }
+    setStatus(`${localPrefix}${outcomes.length ? outcomes.join(', ') : 'recording ready'}`);
   };
 
   useEffect(() => {
@@ -2172,6 +2832,47 @@ const DendroCaptureApp = () => {
     };
   }, [cancelAreaCapture, clearAreaDeliveryWatchdog, deliverAreaSession, restoreMainWindowAfterCancel, showMainWindow, teardownAreaCapture]);
 
+  useEffect(() => {
+    const subscriptions = [
+      listen<VideoRecordingFinished>('video-recording-finished', async (event) => {
+        const context = recordingContextRef.current[event.payload.id];
+        delete recordingContextRef.current[event.payload.id];
+        setRecording(null);
+        await showMainWindow();
+        busyRef.current = null;
+        setBusy(null);
+        setStatus('Processing recording');
+        await processVideoRecording(
+          context?.mode || 'area',
+          event.payload,
+          context?.context || null,
+          context?.startedAt,
+        );
+      }),
+      listen<VideoRecordingProblem>('video-recording-cancelled', async (event) => {
+        delete recordingContextRef.current[event.payload.id];
+        setRecording(null);
+        await showMainWindow();
+        busyRef.current = null;
+        setBusy(null);
+        setStatus('Recording canceled');
+      }),
+      listen<VideoRecordingProblem>('video-recording-error', async (event) => {
+        delete recordingContextRef.current[event.payload.id];
+        setRecording(null);
+        await showMainWindow();
+        busyRef.current = null;
+        setBusy(null);
+        setStatus(event.payload.message || 'Recording failed');
+      }),
+    ];
+    return () => {
+      subscriptions.forEach((subscription) => {
+        void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+      });
+    };
+  }, [showMainWindow]);
+
   const startAreaCapture = useCallback(async () => {
     if (busyRef.current) return;
     busyRef.current = 'area';
@@ -2255,23 +2956,142 @@ const DendroCaptureApp = () => {
     teardownAreaCapture,
   ]);
 
-  const openFullscreenPicker = useCallback(async () => {
+  const openRecordingControlsWindow = useCallback(async (session: RecordingState) => {
+    const existing = await WebviewWindow.getByLabel('recording-controls').catch(() => null);
+    await existing?.close().catch(() => undefined);
+    const monitor = await currentMonitor().catch(() => null);
+    const width = 520;
+    const height = 74;
+    const x = monitor ? Math.round(monitor.workArea.position.x + (monitor.workArea.size.width - width) / 2) : undefined;
+    const y = monitor ? Math.round(monitor.workArea.position.y + 24) : undefined;
+    const controls = new WebviewWindow('recording-controls', {
+      url: `/?recordingControls=1&recordingId=${encodeURIComponent(session.id)}&mode=${encodeURIComponent(session.mode)}&durationMs=${session.durationMs}&hasAudio=${session.hasAudio ? '1' : '0'}`,
+      x,
+      y,
+      width,
+      height,
+      decorations: false,
+      transparent: false,
+      alwaysOnTop: true,
+      resizable: false,
+      skipTaskbar: true,
+      visible: true,
+      focus: true,
+      shadow: true,
+      contentProtected: true,
+      title: 'DendroCapture Recording',
+    });
+    await new Promise<void>((resolve, reject) => {
+      void controls.once('tauri://created', () => resolve());
+      void controls.once('tauri://error', (event) => {
+        reject(new Error(typeof event.payload === 'string' ? event.payload : 'Could not open recording controls'));
+      });
+    });
+  }, []);
+
+  const beginVideoRecording = useCallback(async (
+    mode: CaptureMode,
+    options: { rect?: CaptureRegionRect; monitorId?: number; context?: CaptureWindowContext | null },
+  ) => {
+    const id = captureId();
+    const durationMs = Math.round(clampNumber(settingsRef.current.videoDurationSeconds, 1, MAX_VIDEO_DURATION_SECONDS) * 1000);
+    const hasAudio = settingsRef.current.videoSystemAudio;
+    const startedAt = new Date().toISOString();
+    recordingContextRef.current[id] = {
+      mode,
+      startedAt,
+      context: cleanCaptureContext(options.context),
+    };
+    const state: RecordingState = {
+      id,
+      mode,
+      startedAt,
+      paused: false,
+      durationMs,
+      hasAudio,
+    };
+    setRecording(state);
+    busyRef.current = `video-${id}`;
+    setBusy(`video-${id}`);
+    setStatus(mode === 'fullscreen' ? 'Recording fullscreen' : 'Recording selected area');
+    await invoke('start_video_recording', {
+      request: {
+        id,
+        mode,
+        monitorId: options.monitorId,
+        rect: options.rect,
+        durationMs,
+        frameRate: VIDEO_FRAME_RATE,
+        includeAudio: hasAudio,
+      },
+    });
+    await openRecordingControlsWindow(state).catch((error) => {
+      console.warn('Could not open recording controls', error);
+      setStatus('Recording started. Use the tray window to stop or cancel if controls did not appear.');
+    });
+  }, [openRecordingControlsWindow]);
+
+  const startVideoAreaCapture = useCallback(async () => {
+    if (busyRef.current) return;
+    busyRef.current = 'video-area';
+    setBusy('video-area');
+    setFullscreenPicker(null);
+    setStatus('Select an area to record');
+    try {
+      await hideMainWindowForCapture(true);
+      const context = await readActiveWindowContext();
+      const cursor = await cursorPosition().catch(() => null);
+      const rect = await invoke<CaptureRegionRect>('select_area_region', {
+        cursorX: cursor ? Math.round(cursor.x) : null,
+        cursorY: cursor ? Math.round(cursor.y) : null,
+      });
+      await beginVideoRecording('area', { rect, context });
+    } catch (error) {
+      await showMainWindow();
+      busyRef.current = null;
+      setBusy(null);
+      setRecording(null);
+      setStatus(errorMessage(error, 'Video area recording canceled'));
+    }
+  }, [beginVideoRecording, hideMainWindowForCapture, readActiveWindowContext, showMainWindow]);
+
+  const startVideoFullscreenCapture = useCallback(async (preview: MonitorPreview) => {
+    setFullscreenPicker(null);
+    if (busyRef.current) return;
+    busyRef.current = `video-fullscreen-${preview.monitor.id}`;
+    setBusy(`video-fullscreen-${preview.monitor.id}`);
+    setStatus(preview.monitor.isPrimary ? 'Starting primary display recording' : 'Starting display recording');
+    try {
+      await hideMainWindowForCapture(true);
+      const context = await readActiveWindowContext();
+      await beginVideoRecording('fullscreen', { monitorId: preview.monitor.id, context });
+    } catch (error) {
+      await showMainWindow();
+      busyRef.current = null;
+      setBusy(null);
+      setRecording(null);
+      setStatus(errorMessage(error, 'Fullscreen recording failed'));
+    }
+  }, [beginVideoRecording, hideMainWindowForCapture, readActiveWindowContext, showMainWindow]);
+
+  const openFullscreenPicker = useCallback(async (purpose: 'image' | 'video' = 'image') => {
     if (busyRef.current) return;
     busyRef.current = 'fullscreen-picker';
     setBusy('fullscreen-picker');
     setStatus('Loading display previews');
-    setFullscreenPicker({ loading: true, previews: [] });
+    setFullscreenPicker({ loading: true, purpose, previews: [] });
     try {
       const previews = await withTimeout(
         invoke<MonitorPreview[]>('capture_monitor_previews', { maxWidth: 220 }),
         10000,
         'Could not load display previews. Windows screen capture did not respond.',
       );
-      setFullscreenPicker({ loading: false, previews });
+      setFullscreenPicker({ loading: false, purpose, previews });
       setStatus('Choose a display to capture');
     } catch (error) {
       setFullscreenPicker({
         loading: false,
+        purpose,
         previews: [],
         error: error instanceof Error ? error.message : 'Could not load display previews',
       });
@@ -2283,6 +3103,10 @@ const DendroCaptureApp = () => {
   }, []);
 
   const captureSelectedDisplay = async (preview: MonitorPreview) => {
+    if (fullscreenPicker?.purpose === 'video') {
+      await startVideoFullscreenCapture(preview);
+      return;
+    }
     setFullscreenPicker(null);
     busyRef.current = `fullscreen-${preview.monitor.id}`;
     setBusy(`fullscreen-${preview.monitor.id}`);
@@ -2320,6 +3144,8 @@ const DendroCaptureApp = () => {
       const bindings: Array<[string, () => void]> = [
         [normalizedShortcut(settings.areaShortcut), () => void startAreaCapture()],
         [normalizedShortcut(settings.fullscreenShortcut), () => void openFullscreenPicker()],
+        [normalizedShortcut(settings.videoAreaShortcut), () => void startVideoAreaCapture()],
+        [normalizedShortcut(settings.videoFullscreenShortcut), () => void openFullscreenPicker('video')],
       ];
       for (const [shortcut, action] of bindings) {
         await register(shortcut, (event) => {
@@ -2336,7 +3162,16 @@ const DendroCaptureApp = () => {
         escapeRegisteredRef.current = false;
       });
     };
-  }, [settings.areaShortcut, settings.fullscreenShortcut, recordingShortcut, startAreaCapture, openFullscreenPicker]);
+  }, [
+    settings.areaShortcut,
+    settings.fullscreenShortcut,
+    settings.videoAreaShortcut,
+    settings.videoFullscreenShortcut,
+    recordingShortcut,
+    startAreaCapture,
+    openFullscreenPicker,
+    startVideoAreaCapture,
+  ]);
 
   const retryPending = async (capture: PendingCapture) => {
     const destination = queueDestination(capture);
@@ -2410,8 +3245,25 @@ const DendroCaptureApp = () => {
     setStatus('Uploading current capture');
     let queuedForRetry = false;
     try {
-      const pngBase64 = await originalPngForCapture(item);
       const apiItem: PendingCapture = { ...item, destination: 'dendroApi' };
+      if (isVideoCapture(item)) {
+        if (!apiItem.filePath) throw new Error('Recording file no longer exists');
+        if (settingsRef.current.saveLocally) {
+          addPending(apiItem);
+          queuedForRetry = true;
+        }
+        const uploaded = await uploadCapture(apiItem);
+        const uploadedItem = uploaded.openUrl ? { ...item, assetUrl: uploaded.openUrl } : item;
+        const finalItem = settingsRef.current.saveLocally
+          ? uploadedItem
+          : await deleteTransientCaptureFile(uploadedItem, { preservePreview: true });
+        updateCaptureRecord(finalItem);
+        setLastCapture(finalItem);
+        setStatus('Current recording uploaded');
+        return;
+      }
+
+      const pngBase64 = await originalPngForCapture(item);
       if (settingsRef.current.saveLocally) {
         await invoke('save_pending_capture', { id: apiItem.id, pngBase64 }).catch((error) => {
           console.warn('Could not persist manual upload queue item', error);
@@ -2463,14 +3315,38 @@ const DendroCaptureApp = () => {
     if (busyRef.current) return;
     const item: LocalCapture = latestCapture;
     setPreviewMenuOpen(false);
-    if (item.filePath) {
+    const sourceWasTransientPreview = isTransientPreviewCapture(item);
+    if (item.filePath && !sourceWasTransientPreview) {
       await revealCapture(item);
       return;
     }
     busyRef.current = `save-${item.id}`;
     setBusy(`save-${item.id}`);
-    setStatus('Saving current capture locally');
+    setStatus(isVideoCapture(item) ? 'Saving current recording locally' : 'Saving current capture locally');
     try {
+      if (isVideoCapture(item)) {
+        if (!item.filePath) throw new Error('Recording file no longer exists');
+        const filename = captureFileName(new Date(item.capturedAt), item);
+        const saved = await invoke<LocalCaptureSave>('save_local_capture_file', {
+          filename,
+          sourcePath: item.filePath,
+          mediaKind: 'video',
+          metadataJson: metadataForCapture(item, filename),
+        });
+        const savedCapture = { ...item, filePath: saved.filePath };
+        addLocalCapture(savedCapture);
+        setLastCapture(savedCapture);
+        if (sourceWasTransientPreview) {
+          await invoke('delete_capture_file', { path: item.filePath }).catch((error) => {
+            console.warn('Could not delete transient recording after local save', error);
+          });
+          if (transientPreviewFileRef.current?.filePath === item.filePath) {
+            transientPreviewFileRef.current = null;
+          }
+        }
+        setStatus('Current recording saved locally');
+        return;
+      }
       const pngBase64 = await originalPngForCapture(item);
       const filename = captureFileName(new Date(item.capturedAt), item);
       const saved = await invoke<LocalCaptureSave>('save_local_capture', {
@@ -2491,12 +3367,40 @@ const DendroCaptureApp = () => {
   };
 
   const copyLastCapture = async () => {
+    if (isVideoCapture(latestCapture)) {
+      setStatus('Video recordings are not copied to the image clipboard');
+      return;
+    }
     if (!lastCaptureImage) return;
     try {
       await invoke('copy_png_to_clipboard', { pngBase64: lastCaptureImage });
       setStatus('Copied last capture to clipboard');
     } catch (error) {
       setStatus(`Copy failed: ${errorMessage(error, 'Unknown error')}`);
+    }
+  };
+
+  const exportLatestGif = async () => {
+    if (!latestCapture || !isVideoCapture(latestCapture)) return;
+    if (!latestCapture.filePath) {
+      setStatus('Save this recording locally before exporting GIF');
+      return;
+    }
+    if ((latestCapture.durationMs || 0) > GIF_EXPORT_MAX_DURATION_MS) {
+      setStatus('GIF export is only available for recordings up to 15 seconds');
+      return;
+    }
+    setPreviewMenuOpen(false);
+    setStatus('Exporting GIF');
+    try {
+      const result = await invoke<GifExportResult>('export_video_gif', {
+        sourcePath: latestCapture.filePath,
+        durationMs: latestCapture.durationMs || 0,
+      });
+      await invoke('reveal_in_folder', { path: result.filePath }).catch(() => undefined);
+      setStatus('GIF exported');
+    } catch (error) {
+      setStatus(errorMessage(error, 'Could not export GIF'));
     }
   };
 
@@ -2576,9 +3480,13 @@ const DendroCaptureApp = () => {
     { id: 'capture', label: 'Capture', icon: <Aperture size={15} /> },
   ];
   const latestCapture: LocalCapture | null = lastCapture || localCaptures[0] || pending[0] || null;
-  const latestPreview = lastCaptureImage || latestCapture?.previewBase64;
   const pairedDevice = hasPairedDevice(device) ? device : null;
-  const captureBusy = busy === 'area' || busy === 'fullscreen-picker' || !!busy?.startsWith('fullscreen-');
+  const captureBusy = busy === 'area'
+    || busy === 'video-area'
+    || busy === 'fullscreen-picker'
+    || !!busy?.startsWith('fullscreen-')
+    || !!busy?.startsWith('video-')
+    || !!recording;
   const destinationLabel = captureDestinationLabel(settings.captureDestination);
   const destinationDetail = settings.captureDestination === 'local'
     ? 'local storage'
@@ -2612,8 +3520,19 @@ const DendroCaptureApp = () => {
     : settings.captureDestination === 'googleDrive' && googleDrive.linked
       ? googleDrive.folderName || 'DendroCapture'
       : destinationLabel;
-  const historyBlockedByCloud = settings.captureDestination !== 'local' && !settings.saveLocally;
+  const historyBlockedByCloud = !settings.saveLocally;
   const captureHeaderStatus = captureBusy ? status : 'Fast screenshots, instant clipboard, clean workflow.';
+  const latestIsVideo = isVideoCapture(latestCapture);
+  const latestPreview = latestIsVideo ? latestCapture?.previewBase64 : (lastCaptureImage || latestCapture?.previewBase64);
+  const latestVideoSrc = useMemo(() => {
+    if (!latestIsVideo || !latestCapture?.filePath) return null;
+    try {
+      return convertFileSrc(latestCapture.filePath);
+    } catch {
+      return null;
+    }
+  }, [latestCapture?.filePath, latestIsVideo]);
+  const latestHasPreview = latestIsVideo ? Boolean(latestVideoSrc || latestPreview) : Boolean(latestPreview);
 
   return (
     <div className="dc-root">
@@ -2707,7 +3626,7 @@ const DendroCaptureApp = () => {
                   {fullscreenPicker && (
                     <div className="dc-fullscreen-picker">
                       <div className="dc-picker-head">
-                        <strong>Capture Fullscreen</strong>
+                        <strong>{fullscreenPicker.purpose === 'video' ? 'Record Fullscreen' : 'Capture Fullscreen'}</strong>
                         <button type="button" onClick={() => setFullscreenPicker(null)} aria-label="Close fullscreen picker">
                           <X size={14} />
                         </button>
@@ -2739,13 +3658,13 @@ const DendroCaptureApp = () => {
                   <div className="dc-preview-toolbar">
                     <button
                       type="button"
-                      disabled={!latestCapture || !latestPreview}
-                      title="Draw"
+                      disabled={!latestCapture || !latestPreview || latestIsVideo}
+                      title={latestIsVideo ? 'Image editor is disabled for videos' : 'Draw'}
                       onClick={() => { if (latestCapture) void openDrawEditor(latestCapture, 'latest'); }}
                     >
                       <Brush size={16} />
                     </button>
-                    <button type="button" disabled={!latestPreview} title="Copy image" onClick={() => void copyLastCapture()}>
+                    <button type="button" disabled={!latestPreview || latestIsVideo} title={latestIsVideo ? 'Video recordings are not copied to the image clipboard' : 'Copy image'} onClick={() => void copyLastCapture()}>
                       <Copy size={16} />
                     </button>
                     <div className="dc-preview-menu">
@@ -2765,31 +3684,57 @@ const DendroCaptureApp = () => {
                           </button>
                           <button type="button" onClick={() => void openLatestAsset()} disabled={!onlineImageUrl(latestCapture)}>
                             <Link size={14} />
-                            <span>Open online image</span>
+                            <span>{latestIsVideo ? 'Open online video' : 'Open online image'}</span>
                           </button>
+                          {latestIsVideo && (
+                            <button type="button" onClick={() => void exportLatestGif()} disabled={!latestCapture.filePath || (latestCapture.durationMs || 0) > GIF_EXPORT_MAX_DURATION_MS}>
+                              <FileVideo size={14} />
+                              <span>Export GIF</span>
+                            </button>
+                          )}
                           <button type="button" onClick={() => void saveLatestCaptureLocally()} disabled={!!busy}>
                             <Download size={14} />
-                            <span>{latestCapture.filePath ? 'Show local file' : 'Save locally'}</span>
+                            <span>{latestCapture.filePath && !isTransientPreviewCapture(latestCapture) ? 'Show local file' : 'Save locally'}</span>
                           </button>
                         </div>
                       ) : null}
                     </div>
                   </div>
-                  {latestPreview ? (
+                  {latestHasPreview ? (
                     <>
                       <div className="dc-preview-frame">
-                        <div
-                          className="dc-preview-image"
-                          role="img"
-                          aria-label="Last capture"
-                          style={{ backgroundImage: `url("${dataUrl(latestPreview)}")` }}
-                        />
+                        {latestIsVideo && latestVideoSrc ? (
+                          <PreviewVideoPlayer
+                            src={latestVideoSrc}
+                            poster={latestPreview ? dataUrl(latestPreview) : undefined}
+                          />
+                        ) : latestPreview ? (
+                          <div
+                            className="dc-preview-image"
+                            role="img"
+                            aria-label="Last capture"
+                            style={{ backgroundImage: `url("${dataUrl(latestPreview)}")` }}
+                          >
+                            {latestIsVideo && (
+                            <span className="dc-video-play-badge">
+                              <Play size={18} />
+                            </span>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="dc-empty-preview">
+                            <FileVideo size={38} />
+                            <strong>Recording ready</strong>
+                            <span>Save the MP4 locally to preview it here.</span>
+                          </div>
+                        )}
                       </div>
                       {latestCapture && (
                         <div className="dc-preview-meta">
-                          <span>{latestCapture.mode}</span>
+                          <span>{latestIsVideo ? 'video' : latestCapture.mode}</span>
                           <span>{latestCapture.width}x{latestCapture.height}</span>
-                          <span>Copied as PNG</span>
+                          <span>{latestIsVideo ? durationLabel(latestCapture.durationMs) : 'Copied as PNG'}</span>
+                          {latestIsVideo && <span>{latestCapture.hasAudio ? 'Audio' : 'No audio'}</span>}
                         </div>
                       )}
                     </>
@@ -2825,6 +3770,50 @@ const DendroCaptureApp = () => {
                       <ChevronRight size={22} />
                     </button>
                   </div>
+                  <div className="dc-action-slot">
+                    <button type="button" className="dc-primary-action video" onClick={() => void startVideoAreaCapture()} disabled={captureBusy}>
+                      <span className="dc-action-icon">
+                        <Video size={25} />
+                      </span>
+                      <span className="dc-action-copy">
+                        <strong>Record Area</strong>
+                        <kbd>{settings.videoAreaShortcut}</kbd>
+                      </span>
+                      <ChevronRight size={22} />
+                    </button>
+                  </div>
+                  <div className="dc-action-slot">
+                    <button type="button" className="dc-primary-action secondary video" onClick={() => void openFullscreenPicker('video')} disabled={captureBusy}>
+                      <span className="dc-action-icon">
+                        <FileVideo size={25} />
+                      </span>
+                      <span className="dc-action-copy">
+                        <strong>Record Fullscreen</strong>
+                        <kbd>{settings.videoFullscreenShortcut}</kbd>
+                      </span>
+                      <ChevronRight size={22} />
+                    </button>
+                  </div>
+                  <div className="dc-video-summary">
+                    <span>{durationLabel(settings.videoDurationSeconds * 1000)} max</span>
+                    <span>{VIDEO_FRAME_RATE}fps</span>
+                    <button
+                      type="button"
+                      className={settings.videoSystemAudio ? 'on' : 'off'}
+                      onClick={() => updateSettings({ videoSystemAudio: !settings.videoSystemAudio })}
+                    >
+                      {settings.videoSystemAudio ? <Volume2 size={13} /> : <VolumeX size={13} />}
+                      {settings.videoSystemAudio ? 'System audio' : 'No audio'}
+                    </button>
+                    <button
+                      type="button"
+                      className={settings.saveLocally ? 'on' : 'off'}
+                      onClick={() => updateSettings({ saveLocally: !settings.saveLocally })}
+                    >
+                      {settings.saveLocally ? <CheckCircle2 size={13} /> : <X size={13} />}
+                      {settings.saveLocally ? 'Save local copy' : 'No local copy'}
+                    </button>
+                  </div>
                 </div>
               </section>
             )}
@@ -2842,7 +3831,7 @@ const DendroCaptureApp = () => {
                   <div className="dc-empty-drop">
                     <Cloud size={36} />
                     <strong>Local history is off</strong>
-                    <span>Turn on Save captures locally or choose Local as the destination.</span>
+                    <span>Turn on Save local copy to keep captures in History.</span>
                   </div>
                 ) : localCaptures.length === 0 ? (
                   <div className="dc-empty-drop">
@@ -2859,21 +3848,28 @@ const DendroCaptureApp = () => {
                         title={item.filePath ? 'Show in folder' : undefined}
                         onClick={() => { if (item.filePath) void revealCapture(item); }}
                       >
-                        {item.previewBase64 ? <img src={dataUrl(item.previewBase64)} alt="" /> : <div><ImageIcon size={24} /></div>}
+                        <div className="dc-history-thumb">
+                          {item.previewBase64
+                            ? <img src={dataUrl(item.previewBase64)} alt="" />
+                            : <div>{isVideoCapture(item) ? <FileVideo size={24} /> : <ImageIcon size={24} />}</div>}
+                          {isVideoCapture(item) && <span className="dc-card-video-badge"><Play size={12} /> {durationLabel(item.durationMs)}</span>}
+                        </div>
                         <strong>{captureTitle(item)}</strong>
-                        <small>{relativeTime(item.capturedAt)} - {item.width}x{item.height}</small>
+                        <small>{relativeTime(item.capturedAt)} - {item.width}x{item.height}{isVideoCapture(item) ? ` - ${item.hasAudio ? 'audio' : 'silent'}` : ''}</small>
                         {item.filePath && <code>{item.filePath}</code>}
-                        <button
-                          type="button"
-                          className="dc-card-action"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void openDrawEditor(item, 'history');
-                          }}
-                        >
-                          <Brush size={13} />
-                          Draw
-                        </button>
+                        {!isVideoCapture(item) && (
+                          <button
+                            type="button"
+                            className="dc-card-action"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void openDrawEditor(item, 'history');
+                            }}
+                          >
+                            <Brush size={13} />
+                            Draw
+                          </button>
+                        )}
                       </article>
                     ))}
                   </div>
@@ -2903,10 +3899,10 @@ const DendroCaptureApp = () => {
                   <div className="dc-queue-row" key={`${item.id}-${queueDestination(item)}`}>
                     {item.previewBase64
                       ? <img src={dataUrl(item.previewBase64)} alt="" className="dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)} />
-                      : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}><Aperture size={16} /></div>}
+                      : <div className="dc-queue-placeholder dc-clickable" title="Show in folder" onClick={() => void revealCapture(item)}>{isVideoCapture(item) ? <FileVideo size={16} /> : <Aperture size={16} />}</div>}
                     <span>
                       <strong>{captureTitle(item)}</strong>
-                      <small>{queueDestinationLabel(item)} - {item.width}x{item.height} - {relativeTime(item.capturedAt)}</small>
+                      <small>{queueDestinationLabel(item)} - {item.width}x{item.height}{isVideoCapture(item) ? ` - ${durationLabel(item.durationMs)}` : ''} - {relativeTime(item.capturedAt)}</small>
                     </span>
                     <button
                       type="button"
@@ -2949,7 +3945,7 @@ const DendroCaptureApp = () => {
                       <ImageIcon size={18} />
                       <span>
                         <strong>Local</strong>
-                        <small>Save captures on this computer.</small>
+                        <small>Keep captures on this computer only.</small>
                       </span>
                     </button>
                     <button
@@ -2981,7 +3977,7 @@ const DendroCaptureApp = () => {
                 {settingsSection === 'local' && (
                 <div className="dc-panel">
                   <h2>Local</h2>
-                  <p className="dc-muted">Local captures are written to this computer. Clipboard copy still happens even when local saving is off for cloud destinations.</p>
+                  <p className="dc-muted">Local saving controls whether captures are kept in History. Screenshots still copy to the clipboard, and videos use a temporary file while recording or uploading.</p>
                   <button
                     type="button"
                     className={`dc-api-toggle ${settings.captureDestination === 'local' ? 'on' : 'off'}`}
@@ -2994,12 +3990,11 @@ const DendroCaptureApp = () => {
                     <input
                       type="checkbox"
                       checked={settings.saveLocally}
-                      disabled={settings.captureDestination === 'local'}
                       onChange={(e) => updateSettings({ saveLocally: e.target.checked })}
                     />
                     <span>
-                      Save captures locally
-                      <small>Required for Local destination. For cloud destinations, this keeps local history and retry files.</small>
+                      Save local copy
+                      <small>When off, cloud captures upload without entering local History. Upload retries need this on.</small>
                     </span>
                   </label>
                 </div>
@@ -3221,6 +4216,34 @@ const DendroCaptureApp = () => {
                     </button>
                   </label>
                   <label>
+                    Record Area shortcut
+                    <button
+                      type="button"
+                      className={`dc-shortcut-recorder${recordingShortcut === 'videoAreaShortcut' ? ' recording' : ''}`}
+                      onClick={() => {
+                        setRecordingShortcut('videoAreaShortcut');
+                        setStatus('Press the new Record Area shortcut');
+                      }}
+                    >
+                      <span>{recordingShortcut === 'videoAreaShortcut' ? 'Press shortcut...' : settings.videoAreaShortcut}</span>
+                      <small>{recordingShortcut === 'videoAreaShortcut' ? 'Esc cancels' : 'Click to change'}</small>
+                    </button>
+                  </label>
+                  <label>
+                    Record Fullscreen shortcut
+                    <button
+                      type="button"
+                      className={`dc-shortcut-recorder${recordingShortcut === 'videoFullscreenShortcut' ? ' recording' : ''}`}
+                      onClick={() => {
+                        setRecordingShortcut('videoFullscreenShortcut');
+                        setStatus('Press the new Record Fullscreen shortcut');
+                      }}
+                    >
+                      <span>{recordingShortcut === 'videoFullscreenShortcut' ? 'Press shortcut...' : settings.videoFullscreenShortcut}</span>
+                      <small>{recordingShortcut === 'videoFullscreenShortcut' ? 'Esc cancels' : 'Click to change'}</small>
+                    </button>
+                  </label>
+                  <label>
                     Output resolution scale <b>{qualityLabel}</b>
                     <input
                       type="range"
@@ -3241,6 +4264,28 @@ const DendroCaptureApp = () => {
                       value={settings.delayedAreaCaptureSeconds}
                       onChange={(e) => updateSettings({ delayedAreaCaptureSeconds: clampNumber(Number(e.target.value), 0, 10) })}
                     />
+                  </label>
+                  <label>
+                    Video duration <b>{durationLabel(settings.videoDurationSeconds * 1000)}</b>
+                    <input
+                      type="range"
+                      min="1"
+                      max={MAX_VIDEO_DURATION_SECONDS}
+                      step="1"
+                      value={settings.videoDurationSeconds}
+                      onChange={(e) => updateSettings({ videoDurationSeconds: clampNumber(Number(e.target.value), 1, MAX_VIDEO_DURATION_SECONDS) })}
+                    />
+                  </label>
+                  <label className="dc-check dc-check-with-hint">
+                    <input
+                      type="checkbox"
+                      checked={settings.videoSystemAudio}
+                      onChange={(e) => updateSettings({ videoSystemAudio: e.target.checked })}
+                    />
+                    <span>
+                      Include system audio in video recordings
+                      <small>Use default windows audio, GIF cannot include audio.</small>
+                    </span>
                   </label>
                   <label className="dc-check">
                     <input
@@ -3299,10 +4344,12 @@ const DendroCaptureApp = () => {
   );
 };
 
-const isCaptureOverlay = new URLSearchParams(window.location.search).get('captureOverlay') === 'area';
+const bootParams = new URLSearchParams(window.location.search);
+const isCaptureOverlay = bootParams.get('captureOverlay') === 'area';
+const isRecordingControls = bootParams.get('recordingControls') === '1';
 
 createRoot(document.getElementById('root')!).render(
   <BootErrorBoundary>
-    {isCaptureOverlay ? <CaptureOverlayApp /> : <DendroCaptureApp />}
+    {isCaptureOverlay ? <CaptureOverlayApp /> : isRecordingControls ? <RecordingControlsApp /> : <DendroCaptureApp />}
   </BootErrorBoundary>,
 );
