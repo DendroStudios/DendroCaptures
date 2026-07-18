@@ -3457,8 +3457,11 @@ fn active_window_context() -> ActiveWindowContext {
 fn hide_main_window_for_tray<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_content_protected(false);
-        let _ = window.set_skip_taskbar(true);
+        // Hide first, then drop the taskbar button. The reverse order can be
+        // interrupted between the two calls and leave a taskbar button that
+        // points at a hidden window - clicking it does nothing.
         let _ = window.hide();
+        let _ = window.set_skip_taskbar(true);
     }
 }
 
@@ -3483,9 +3486,14 @@ fn window_is_on_a_monitor<R: Runtime>(window: &tauri::WebviewWindow<R>) -> bool 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_content_protected(false);
-        let _ = window.set_skip_taskbar(false);
-        let _ = window.unminimize();
+        let _ = window.set_fullscreen(false);
+        let _ = window.set_always_on_top(false);
+        let _ = window.unmaximize();
+        // Show and restore before touching the taskbar button so the button
+        // always points at a window that can actually be activated.
         let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_skip_taskbar(false);
         let _ = window.set_focus();
         // A monitor change can leave the window stranded outside every
         // display: it "opens" but nothing appears on screen.
@@ -3493,6 +3501,13 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
             let _ = window.center();
         }
     }
+}
+
+/// Frontend entry point for restoring the window, so tray clicks, taskbar
+/// recovery and capture flows all share the exact same show sequence.
+#[tauri::command]
+fn present_main_window(app: AppHandle) {
+    show_main_window(&app);
 }
 
 fn create_tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
@@ -3592,6 +3607,7 @@ pub fn run() {
             cancel_video_recording,
             export_video_gif,
             prepare_overlay_window,
+            present_main_window,
             copy_png_to_clipboard,
             platform_label,
             active_window_context,

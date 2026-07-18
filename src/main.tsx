@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { emitTo, listen } from '@tauri-apps/api/event';
-import { currentMonitor, cursorPosition, getCurrentWindow, LogicalSize, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
+import { currentMonitor, cursorPosition, getCurrentWindow, PhysicalPosition, PhysicalSize } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import { register, unregister, unregisterAll } from '@tauri-apps/plugin-global-shortcut';
@@ -264,7 +264,7 @@ interface CaptureCancelPayload {
   restoreWindow?: boolean;
 }
 
-const APP_VERSION = '0.1.63';
+const APP_VERSION = '0.1.66';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
@@ -273,8 +273,11 @@ const LIVE_SELECTION_DEFAULT_KEY = 'dendro-capture:live-selection-default-v1';
 const OPEN_AFTER_UPLOAD_DEFAULT_OFF_KEY = 'dendro-capture:open-after-upload-default-off-v1';
 const SIDEBAR_KEY = 'dendro-capture:sidebar-collapsed';
 const CHUNK_SIZE = 8 * 1024 * 1024;
-const MIN_APP_WIDTH = 820;
-const MIN_APP_HEIGHT = 500;
+// Small logical work areas (a 1080p secondary screen at 150%+ display zoom)
+// must still fit the whole app; keep the floor low so the window is never
+// forced to be larger than the monitor it sits on.
+const MIN_APP_WIDTH = 780;
+const MIN_APP_HEIGHT = 480;
 const MAX_APP_WIDTH = 1120;
 const MAX_APP_HEIGHT = 720;
 const MEDIA_FULLSCREEN_CLASS = 'dc-media-fullscreen-active';
@@ -1314,6 +1317,9 @@ const DendroCaptureApp = () => {
   const googleDriveRef = useRef(googleDrive);
   const busyRef = useRef<string | null>(busy);
   const fitWindowTimerRef = useRef<number | null>(null);
+  // Last physical size we intentionally applied; lets the resize watchdog
+  // tell our own resizes apart from the OS rescaling the window (DPI change).
+  const lastFitSizeRef = useRef<{ width: number; height: number } | null>(null);
   const areaSessionRef = useRef<{ captureId: string; session: AreaCaptureSession } | null>(null);
   const pendingAreaPayloadRef = useRef<AreaSessionPayload | null>(null);
   const areaDeliveryWatchdogRef = useRef<number | null>(null);
@@ -1347,6 +1353,49 @@ const DendroCaptureApp = () => {
     void prepareTrayStartup();
   }, []);
 
+  // Sizes are applied in physical pixels. The conversion uses the *window's*
+  // live scale factor (the DPI the webview actually renders at) rather than
+  // the monitor's: when the window straddles screens or a DPI change is still
+  // settling, the two disagree, and sizing from the monitor's value leaves
+  // the CSS viewport smaller than the layout minimum - the "cut off" window.
+  const applyWindowSizeForMonitor = useCallback(async (logicalWidth: number, logicalHeight: number, monitor: Awaited<ReturnType<typeof currentMonitor>>) => {
+    const win = getCurrentWindow();
+    const applyOnce = async () => {
+      const windowScale = await win.scaleFactor().catch(() => 0);
+      const scaleFactor = windowScale || monitor?.scaleFactor || 1;
+      const physicalWidth = Math.round(logicalWidth * scaleFactor);
+      const physicalHeight = Math.round(logicalHeight * scaleFactor);
+      lastFitSizeRef.current = { width: physicalWidth, height: physicalHeight };
+      await win.setSize(new PhysicalSize(physicalWidth, physicalHeight)).catch(() => undefined);
+    };
+    await applyOnce();
+    // Verify against the CSS viewport, the ground truth for "content is cut":
+    // if Windows rescaled the window between reading the scale factor and the
+    // resize landing, re-apply once with the fresh value.
+    await wait(60);
+    if (
+      !isMediaFullscreenActive()
+      && (Math.abs(window.innerWidth - logicalWidth) > 3
+        || Math.abs(window.innerHeight - logicalHeight) > 3)
+    ) {
+      await applyOnce();
+    }
+    if (!monitor) return;
+    // Keep the whole window inside the monitor's work area; a resize near an
+    // edge (or a DPI change) can push part of it off screen.
+    const position = await win.outerPosition().catch(() => null);
+    const size = await win.outerSize().catch(() => null);
+    if (!position || !size) return;
+    const workArea = monitor.workArea;
+    const maxX = workArea.position.x + Math.max(0, workArea.size.width - size.width);
+    const maxY = workArea.position.y + Math.max(0, workArea.size.height - size.height);
+    const x = Math.round(clampNumber(position.x, workArea.position.x, Math.max(workArea.position.x, maxX)));
+    const y = Math.round(clampNumber(position.y, workArea.position.y, Math.max(workArea.position.y, maxY)));
+    if (x !== position.x || y !== position.y) {
+      await win.setPosition(new PhysicalPosition(x, y)).catch(() => undefined);
+    }
+  }, []);
+
   const fitWindowToCurrentMonitor = useCallback(async () => {
     if (isMediaFullscreenActive()) return;
     const win = getCurrentWindow();
@@ -1360,8 +1409,8 @@ const DendroCaptureApp = () => {
     const width = Math.round(clampNumber(Math.min(workWidth - 32, workWidth * 0.62), MIN_APP_WIDTH, MAX_APP_WIDTH));
     const height = Math.round(clampNumber(Math.min(workHeight - 32, workHeight * 0.68), MIN_APP_HEIGHT, MAX_APP_HEIGHT));
     await win.setResizable(false).catch(() => undefined);
-    await win.setSize(new LogicalSize(width, height)).catch(() => undefined);
-  }, []);
+    await applyWindowSizeForMonitor(width, height, monitor);
+  }, [applyWindowSizeForMonitor]);
 
   const enlargeWindowForEditor = useCallback(async () => {
     const win = getCurrentWindow();
@@ -1371,9 +1420,9 @@ const DendroCaptureApp = () => {
     const workHeight = monitor ? monitor.workArea.size.height / scaleFactor : 900;
     const width = Math.round(Math.max(MIN_APP_WIDTH, Math.min(workWidth - 48, 1480)));
     const height = Math.round(Math.max(MIN_APP_HEIGHT, Math.min(workHeight - 48, 940)));
-    await win.setSize(new LogicalSize(width, height)).catch(() => undefined);
+    await applyWindowSizeForMonitor(width, height, monitor);
     await win.center().catch(() => undefined);
-  }, []);
+  }, [applyWindowSizeForMonitor]);
 
   useEffect(() => {
     const isEditing = !!editingCapture;
@@ -1412,28 +1461,44 @@ const DendroCaptureApp = () => {
     const win = getCurrentWindow();
     let unlistenMoved: (() => void) | null = null;
     let unlistenScale: (() => void) | null = null;
+    let unlistenResized: (() => void) | null = null;
 
-    const scheduleFit = () => {
+    const scheduleFit = (delayMs: number) => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
       fitWindowTimerRef.current = window.setTimeout(() => {
         fitWindowTimerRef.current = null;
         if (editingCaptureRef.current || isMediaFullscreenActive()) return;
         void fitWindowToCurrentMonitor();
-      }, 520);
+      }, delayMs);
     };
 
     if (!isMediaFullscreenActive()) void fitWindowToCurrentMonitor();
-    void win.onMoved(() => scheduleFit()).then((unlisten) => {
+    // Moves debounce long enough to not fight the user mid-drag; a DPI change
+    // re-fits almost immediately so the window never lingers oversized after
+    // landing on a monitor with a different scale factor.
+    void win.onMoved(() => scheduleFit(450)).then((unlisten) => {
       unlistenMoved = unlisten;
     }).catch(() => undefined);
-    void win.onScaleChanged(() => scheduleFit()).then((unlisten) => {
+    void win.onScaleChanged(() => scheduleFit(80)).then((unlisten) => {
       unlistenScale = unlisten;
+    }).catch(() => undefined);
+    // Watchdog: Windows itself resizes the window on DPI changes (and can do
+    // so after our fit already ran). Any size that is not the one we last
+    // applied gets corrected, so the app can never stay cut off or oversized.
+    void win.onResized((event) => {
+      const target = lastFitSizeRef.current;
+      if (!target) return;
+      if (Math.abs(event.payload.width - target.width) <= 2 && Math.abs(event.payload.height - target.height) <= 2) return;
+      scheduleFit(200);
+    }).then((unlisten) => {
+      unlistenResized = unlisten;
     }).catch(() => undefined);
 
     return () => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
       unlistenMoved?.();
       unlistenScale?.();
+      unlistenResized?.();
     };
   }, [fitWindowToCurrentMonitor]);
 
@@ -2585,33 +2650,65 @@ const DendroCaptureApp = () => {
     processCaptureRef.current = processCapture;
   });
 
-  const showMainWindow = useCallback(async () => {
-    const win = getCurrentWindow();
-    await win.setAlwaysOnTop(false).catch(() => undefined);
-    await win.setSkipTaskbar(false).catch(() => undefined);
-    await win.setDecorations(false).catch(() => undefined);
-    await win.setResizable(false).catch(() => undefined);
-    await win.setFullscreen(false).catch(() => undefined);
-    await win.unmaximize().catch(() => undefined);
-    await win.show().catch(() => undefined);
-    await win.setFocus().catch(() => undefined);
+  // Show and hide requests are chained through a single queue. Concurrent
+  // flows (capture watchdogs, recording events, shortcut spam) used to
+  // interleave the skipTaskbar/hide/show calls and could strand the app as a
+  // hidden window with a live taskbar button - a button that does nothing
+  // when clicked.
+  const windowOpsRef = useRef<Promise<void>>(Promise.resolve());
+  const queueWindowOp = useCallback(<T,>(op: () => Promise<T>): Promise<T> => {
+    const result = windowOpsRef.current.then(op, op);
+    windowOpsRef.current = result.then(() => undefined, () => undefined);
+    return result;
   }, []);
 
-  const hideMainWindowForCapture = useCallback(async (force = false) => {
-    const win = getCurrentWindow();
-    const visible = await win.isVisible().catch(() => false);
-    mainWasVisibleRef.current = visible;
-    if (!visible || (!force && !settingsRef.current.hideDuringCapture)) return;
-    await win.setSkipTaskbar(true).catch(() => undefined);
-    await win.hide().catch(() => undefined);
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      if (!(await win.isVisible().catch(() => false))) break;
-      await wait(60);
-      await win.hide().catch(() => undefined);
+  const showMainWindow = useCallback(async () => {
+    await queueWindowOp(async () => {
+      try {
+        // One shared show sequence with the tray (show -> unminimize ->
+        // restore taskbar button -> focus, re-center if off-monitor).
+        await invoke('present_main_window');
+      } catch {
+        const win = getCurrentWindow();
+        await win.setAlwaysOnTop(false).catch(() => undefined);
+        await win.setFullscreen(false).catch(() => undefined);
+        await win.unmaximize().catch(() => undefined);
+        await win.show().catch(() => undefined);
+        await win.unminimize().catch(() => undefined);
+        await win.setSkipTaskbar(false).catch(() => undefined);
+        await win.setFocus().catch(() => undefined);
+      }
+      const win = getCurrentWindow();
+      await win.setDecorations(false).catch(() => undefined);
+      await win.setResizable(false).catch(() => undefined);
+    });
+    if (!editingCaptureRef.current && !isMediaFullscreenActive()) {
+      // The window may reappear on a different monitor (or DPI) than the one
+      // it was last fit for.
+      await fitWindowToCurrentMonitor().catch(() => undefined);
     }
-    // Give the compositor a moment so the app is not in the snapshot.
-    await wait(180);
-  }, []);
+  }, [fitWindowToCurrentMonitor, queueWindowOp]);
+
+  const hideMainWindowForCapture = useCallback(async (force = false) => {
+    await queueWindowOp(async () => {
+      const win = getCurrentWindow();
+      const visible = await win.isVisible().catch(() => false);
+      mainWasVisibleRef.current = visible;
+      if (!visible || (!force && !settingsRef.current.hideDuringCapture)) return;
+      // Hide before dropping the taskbar button so no ordering ever produces
+      // a taskbar button for an already-hidden window.
+      await win.hide().catch(() => undefined);
+      await win.setSkipTaskbar(true).catch(() => undefined);
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        if (!(await win.isVisible().catch(() => false))) break;
+        await wait(60);
+        await win.hide().catch(() => undefined);
+        await win.setSkipTaskbar(true).catch(() => undefined);
+      }
+      // Give the compositor a moment so the app is not in the snapshot.
+      await wait(180);
+    });
+  }, [queueWindowOp]);
 
   const restoreMainWindowAfterCancel = useCallback(async () => {
     if (mainWasVisibleRef.current) await showMainWindow();
@@ -3904,13 +4001,28 @@ const DendroCaptureApp = () => {
                       <strong>{captureTitle(item)}</strong>
                       <small>{queueDestinationLabel(item)} - {item.width}x{item.height}{isVideoCapture(item) ? ` - ${durationLabel(item.durationMs)}` : ''} - {relativeTime(item.capturedAt)}</small>
                     </span>
-                    <button
-                      type="button"
-                      onClick={() => void retryPending(item)}
-                      disabled={!!busy || (queueDestination(item) === 'dendroApi' ? !settings.apiSendingEnabled : !googleDriveCanUpload())}
-                    >
-                      <RefreshCw size={14} />
-                    </button>
+                    <span className="dc-queue-actions">
+                      <button
+                        type="button"
+                        title={`Retry ${queueDestinationLabel(item)} upload`}
+                        onClick={() => void retryPending(item)}
+                        disabled={!!busy || (queueDestination(item) === 'dendroApi' ? !settings.apiSendingEnabled : !googleDriveCanUpload())}
+                      >
+                        <RefreshCw size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        title="Cancel upload and remove from queue"
+                        onClick={() => {
+                          removePending(item.id, queueDestination(item));
+                          setStatus('Removed capture from upload queue');
+                        }}
+                        disabled={busy === `retry-${item.id}`}
+                      >
+                        <X size={14} />
+                      </button>
+                    </span>
                   </div>
                 ))}
               </section>
