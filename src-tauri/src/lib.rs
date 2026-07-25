@@ -38,6 +38,7 @@ use tauri::{
 const KEYRING_SERVICE: &str = "DendroCapture";
 const KEYRING_DEVICE_KEY: &str = "device-ed25519";
 const KEYRING_GOOGLE_DRIVE_TOKEN_KEY: &str = "google-drive";
+const KEYRING_DISCORD_KEY: &str = "discord-bot";
 const GOOGLE_DRIVE_FOLDER_NAME: &str = "DendroCapture";
 const GOOGLE_DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file openid email profile";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -45,8 +46,16 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
 const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const GOOGLE_DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
+const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+const DISCORD_USER_AGENT: &str = "DiscordBot (https://dendrostudios.com, DendroCapture)";
+const DISCORD_PAIRING_CHANNEL_NAME: &str = "dendrocapture-pairing";
+// Bots get 10 MiB per attachment; leave headroom for the multipart envelope.
+const DISCORD_MAX_UPLOAD_BYTES: u64 = 10_000_000;
+const DISCORD_CONTENT_LIMIT: usize = 2000;
 static GOOGLE_DRIVE_DAY_FOLDER_CACHE: OnceLock<Mutex<HashMap<(String, String), GoogleDriveFile>>> =
     OnceLock::new();
+static DISCORD_PAIRING: OnceLock<Mutex<Option<DiscordPendingPairing>>> = OnceLock::new();
+static DISCORD_PAIRING_ATTEMPT: AtomicU64 = AtomicU64::new(0);
 static VIDEO_RECORDINGS: OnceLock<Mutex<HashMap<String, Arc<VideoRecordingControl>>>> =
     OnceLock::new();
 
@@ -297,6 +306,135 @@ struct GoogleDriveFile {
 #[derive(Debug, Deserialize)]
 struct GoogleDriveFilesList {
     files: Vec<GoogleDriveFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DiscordStoredState {
+    bot_token: String,
+    #[serde(default)]
+    bot_username: String,
+    user_id: String,
+    #[serde(default)]
+    user_name: String,
+    dm_channel_id: String,
+    #[serde(default)]
+    guild_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscordPendingPairing {
+    attempt: u64,
+    code: String,
+    bot_token: String,
+    bot_username: String,
+    channel_id: String,
+    after_message_id: String,
+    guild_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DiscordUser {
+    id: String,
+    username: String,
+    global_name: Option<String>,
+    #[serde(default)]
+    bot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordChannel {
+    id: String,
+    #[serde(rename = "type")]
+    kind: u8,
+    name: Option<String>,
+    guild_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DiscordGuild {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordMessage {
+    id: String,
+    channel_id: String,
+    #[serde(default)]
+    content: String,
+    author: Option<DiscordUser>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordStatus {
+    configured: bool,
+    paired: bool,
+    bot_username: Option<String>,
+    user_name: Option<String>,
+    user_id: Option<String>,
+    guild_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordBeginPairingResult {
+    attempt: u64,
+    code: String,
+    channel_id: String,
+    channel_name: String,
+    guild_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordPairResult {
+    user_name: String,
+    user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordSendCapture {
+    filename: String,
+    png_base64: Option<String>,
+    file_path: Option<String>,
+    media_kind: Option<String>,
+    mime_type: Option<String>,
+    captured_at_unix: Option<i64>,
+    duration_ms: Option<u64>,
+    app_name: Option<String>,
+    window_title: Option<String>,
+    ocr_pending: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordSendResult {
+    message_id: String,
+    channel_id: String,
+    message_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordOcrUpdate {
+    message_id: String,
+    channel_id: String,
+    captured_at_unix: Option<i64>,
+    duration_ms: Option<u64>,
+    media_kind: Option<String>,
+    app_name: Option<String>,
+    window_title: Option<String>,
+    ocr_text: String,
+    ocr_failed: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordOcrUpdateResult {
+    updated: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1627,6 +1765,746 @@ async fn google_drive_update_capture_ocr(
         .map_err(|error| format!("Could not update Google Drive OCR metadata: {error}"))?;
     let _: GoogleDriveFile = google_json(response, "Google Drive OCR metadata update").await?;
     Ok(GoogleDriveOcrUpdateResult { ocr_indexed: true })
+}
+
+fn discord_entry() -> Result<Entry, String> {
+    Entry::new(KEYRING_SERVICE, KEYRING_DISCORD_KEY).map_err(err)
+}
+
+fn load_discord_state() -> Result<Option<DiscordStoredState>, String> {
+    let entry = discord_entry()?;
+    match entry.get_password() {
+        Ok(raw) => serde_json::from_str::<DiscordStoredState>(&raw)
+            .map(Some)
+            .map_err(err),
+        Err(_) => Ok(None),
+    }
+}
+
+fn save_discord_state(state: &DiscordStoredState) -> Result<(), String> {
+    discord_entry()?
+        .set_password(&serde_json::to_string(state).map_err(err)?)
+        .map_err(err)
+}
+
+fn clear_discord_state() -> Result<(), String> {
+    match discord_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            if message.to_ascii_lowercase().contains("no entry") {
+                Ok(())
+            } else {
+                Err(message)
+            }
+        }
+    }
+}
+
+fn clean_discord_bot_token(token: &str) -> Result<String, String> {
+    let clean = token.replace('\0', "").trim().to_string();
+    let clean = clean.strip_prefix("Bot ").unwrap_or(&clean).trim().to_string();
+    if clean.is_empty() {
+        return Err("Paste the Discord bot token in Discord settings first".to_string());
+    }
+    if clean.len() > 120 || clean.chars().any(char::is_whitespace) {
+        return Err("The Discord bot token looks invalid. Copy it from the Developer Portal Bot page.".to_string());
+    }
+    Ok(clean)
+}
+
+fn discord_pairing_slot() -> &'static Mutex<Option<DiscordPendingPairing>> {
+    DISCORD_PAIRING.get_or_init(|| Mutex::new(None))
+}
+
+fn discord_url(path: &str) -> String {
+    format!("{DISCORD_API_BASE}{path}")
+}
+
+fn discord_auth(builder: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    builder
+        .header("Authorization", format!("Bot {token}"))
+        .header("User-Agent", DISCORD_USER_AGENT)
+}
+
+fn discord_reach(error: reqwest::Error) -> String {
+    format!("Could not reach Discord: {error}")
+}
+
+async fn discord_sleep(duration: Duration) {
+    let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(duration)).await;
+}
+
+// Floor for the pairing poll: the channel's newest message id at pairing
+// start. Snowflakes encode Discord's server time, so a skewed local clock
+// can never hide the pairing post ("0" on an empty/unreadable channel —
+// the code is random per attempt, so older text cannot match it anyway).
+async fn discord_latest_message_id(
+    client: &reqwest::Client,
+    token: &str,
+    channel_id: &str,
+) -> Option<String> {
+    let response = discord_auth(
+        client.get(discord_url(&format!(
+            "/channels/{}/messages?limit=1",
+            urlencoding::encode(channel_id)
+        ))),
+        token,
+    )
+    .send()
+    .await
+    .ok()?;
+    let messages: Vec<DiscordMessage> = discord_json(response, "Discord channel probe")
+        .await
+        .ok()?;
+    messages.into_iter().next().map(|message| message.id)
+}
+
+fn discord_pairing_code() -> String {
+    // No 0/O/1/I/L: the code is retyped by hand from another device.
+    const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    let mut rng = OsRng;
+    let mut code = String::from("DENDRO-");
+    for _ in 0..6 {
+        code.push(ALPHABET[rng.next_u32() as usize % ALPHABET.len()] as char);
+    }
+    code
+}
+
+fn discord_error_reason(status: reqwest::StatusCode, body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_u64());
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty());
+    match code {
+        Some(50007) | Some(50278) => "Discord refused the DM. The paired member must share a server with the bot and allow direct messages from server members (Server > Privacy Settings).".to_string(),
+        Some(40003) => "Discord rate limited DM creation. Wait a minute, then try again.".to_string(),
+        Some(40005) => "The file is larger than Discord accepts for bot uploads (about 10 MB).".to_string(),
+        Some(50001) | Some(50013) => format!(
+            "{}. Check the bot's access to the channel (View Channel, Send Messages, Read Message History).",
+            message.unwrap_or_else(|| "Discord denied access".to_string())
+        ),
+        Some(10003) => "Discord could not find that channel. Check the pairing channel still exists and the bot can see it.".to_string(),
+        _ => {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                "Discord rejected the bot token. Copy a fresh token from the Developer Portal (Bot page > Reset Token).".to_string()
+            } else {
+                message.unwrap_or_else(|| format!("Discord returned HTTP {status}"))
+            }
+        }
+    }
+}
+
+async fn discord_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    label: &str,
+) -> Result<T, String> {
+    let status = response.status();
+    let text = response.text().await.map_err(err)?;
+    if !status.is_success() {
+        return Err(format!("{label} failed: {}", discord_error_reason(status, &text)));
+    }
+    serde_json::from_str::<T>(&text)
+        .map_err(|error| format!("{label} returned unreadable JSON: {error}"))
+}
+
+async fn discord_open_dm(
+    client: &reqwest::Client,
+    token: &str,
+    user_id: &str,
+) -> Result<DiscordChannel, String> {
+    discord_json(
+        discord_auth(client.post(discord_url("/users/@me/channels")), token)
+            .json(&json!({ "recipient_id": user_id }))
+            .send()
+            .await
+            .map_err(discord_reach)?,
+        "Discord DM channel",
+    )
+    .await
+}
+
+async fn discord_find_pairing_channel(
+    client: &reqwest::Client,
+    token: &str,
+    channel_override: Option<&str>,
+) -> Result<(DiscordChannel, Option<String>), String> {
+    if let Some(channel_id) = channel_override {
+        let channel: DiscordChannel = discord_json(
+            discord_auth(
+                client.get(discord_url(&format!(
+                    "/channels/{}",
+                    urlencoding::encode(channel_id)
+                ))),
+                token,
+            )
+            .send()
+            .await
+            .map_err(discord_reach)?,
+            "Discord pairing channel lookup",
+        )
+        .await?;
+        if channel.kind != 0 {
+            return Err("The pairing channel ID must point to a normal text channel".to_string());
+        }
+        let guild_name = match channel.guild_id.as_deref() {
+            Some(guild_id) => discord_json::<DiscordGuild>(
+                discord_auth(
+                    client.get(discord_url(&format!(
+                        "/guilds/{}",
+                        urlencoding::encode(guild_id)
+                    ))),
+                    token,
+                )
+                .send()
+                .await
+                .map_err(discord_reach)?,
+                "Discord guild lookup",
+            )
+            .await
+            .ok()
+            .map(|guild| guild.name),
+            None => None,
+        };
+        return Ok((channel, guild_name));
+    }
+
+    let guilds: Vec<DiscordGuild> = discord_json(
+        discord_auth(client.get(discord_url("/users/@me/guilds?limit=200")), token)
+            .send()
+            .await
+            .map_err(discord_reach)?,
+        "Discord server list",
+    )
+    .await?;
+    if guilds.is_empty() {
+        return Err(
+            "The bot is not in any Discord server. Invite it to the Dendro Studios server first."
+                .to_string(),
+        );
+    }
+    for guild in &guilds {
+        let response = discord_auth(
+            client.get(discord_url(&format!(
+                "/guilds/{}/channels",
+                urlencoding::encode(&guild.id)
+            ))),
+            token,
+        )
+        .send()
+        .await
+        .map_err(discord_reach)?;
+        let Ok(channels) = discord_json::<Vec<DiscordChannel>>(response, "Discord channel list").await
+        else {
+            continue;
+        };
+        if let Some(channel) = channels
+            .into_iter()
+            .find(|channel| channel.kind == 0 && channel.name.as_deref() == Some(DISCORD_PAIRING_CHANNEL_NAME))
+        {
+            return Ok((channel, Some(guild.name.clone())));
+        }
+    }
+    Err(format!(
+        "Could not find a #{DISCORD_PAIRING_CHANNEL_NAME} text channel in the bot's servers. Create it (or paste its channel ID in Discord settings) and let the bot view it."
+    ))
+}
+
+fn discord_message_matches_code(content: &str, code: &str) -> bool {
+    // Tolerates "@Bot DENDRO-XXXXXX", lowercase, and stray punctuation.
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_uppercase()
+    };
+    let needle = normalize(code);
+    !needle.is_empty() && normalize(content).contains(&needle)
+}
+
+fn discord_plain_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '`' | '*' | '_' | '~' | '|' | '>' | '#' | '\\') && *c != '\n' && *c != '\r')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn discord_clip_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut clipped: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
+fn discord_capture_header(
+    media_kind: &str,
+    captured_at_unix: Option<i64>,
+    duration_ms: Option<u64>,
+    app_name: Option<&str>,
+    window_title: Option<&str>,
+) -> String {
+    let mut header = if media_kind == "video" {
+        "🎬 **Your Recording**".to_string()
+    } else {
+        "📸 **Your Capture**".to_string()
+    };
+    if let Some(timestamp) = captured_at_unix.filter(|value| *value > 0) {
+        // <t:...:f> renders in the reader's own timezone.
+        header.push_str(&format!(" — <t:{timestamp}:f>"));
+    }
+    if media_kind == "video" {
+        if let Some(duration_ms) = duration_ms.filter(|value| *value > 0) {
+            let total_seconds = duration_ms.div_ceil(1000);
+            header.push_str(&format!(" ({}:{:02})", total_seconds / 60, total_seconds % 60));
+        }
+    }
+    let app = app_name.map(discord_plain_text).filter(|value| !value.is_empty());
+    let title = window_title.map(discord_plain_text).filter(|value| !value.is_empty());
+    let context = match (app, title) {
+        (Some(app), Some(title)) if app != title => Some(format!("{app} — {title}")),
+        (Some(app), _) => Some(app),
+        (None, Some(title)) => Some(title),
+        (None, None) => None,
+    };
+    if let Some(context) = context {
+        header.push('\n');
+        header.push_str(&discord_clip_chars(&context, 160));
+    }
+    header
+}
+
+fn discord_content_with_ocr(header: &str, ocr_text: &str) -> String {
+    let trimmed = ocr_text.trim();
+    if trimmed.is_empty() {
+        return format!("{header}\n_No text detected by OCR._");
+    }
+    // A ``` inside the OCR text would close the code fence early.
+    let safe = trimmed.replace("```", "`\u{200b}`\u{200b}`");
+    let frame = "\n**OCR text**\n```\n\n```";
+    let budget = DISCORD_CONTENT_LIMIT
+        .saturating_sub(header.chars().count() + frame.chars().count() + 8);
+    format!(
+        "{header}\n**OCR text**\n```\n{}\n```",
+        discord_clip_chars(&safe, budget)
+    )
+}
+
+#[tauri::command]
+async fn discord_status(bot_token: Option<String>) -> Result<DiscordStatus, String> {
+    let state = load_discord_state()?;
+    let input_has_token = bot_token
+        .as_deref()
+        .and_then(|value| clean_discord_bot_token(value).ok())
+        .is_some();
+    let paired = state.is_some();
+    Ok(DiscordStatus {
+        configured: input_has_token || paired,
+        paired,
+        bot_username: state
+            .as_ref()
+            .map(|value| value.bot_username.clone())
+            .filter(|value| !value.is_empty()),
+        user_name: state
+            .as_ref()
+            .map(|value| value.user_name.clone())
+            .filter(|value| !value.is_empty()),
+        user_id: state.as_ref().map(|value| value.user_id.clone()),
+        guild_name: state.as_ref().and_then(|value| value.guild_name.clone()),
+    })
+}
+
+#[tauri::command]
+async fn discord_begin_pairing(
+    bot_token: String,
+    pairing_channel_id: Option<String>,
+) -> Result<DiscordBeginPairingResult, String> {
+    let token = clean_discord_bot_token(&bot_token)?;
+    let client = reqwest::Client::new();
+    let bot: DiscordUser = discord_json(
+        discord_auth(client.get(discord_url("/users/@me")), &token)
+            .send()
+            .await
+            .map_err(discord_reach)?,
+        "Discord bot token check",
+    )
+    .await?;
+    let channel_override = pairing_channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (channel, guild_name) =
+        discord_find_pairing_channel(&client, &token, channel_override).await?;
+    let code = discord_pairing_code();
+    let attempt = DISCORD_PAIRING_ATTEMPT.fetch_add(1, Ordering::SeqCst) + 1;
+    let channel_name = channel
+        .name
+        .clone()
+        .unwrap_or_else(|| DISCORD_PAIRING_CHANNEL_NAME.to_string());
+    let after_message_id = discord_latest_message_id(&client, &token, &channel.id)
+        .await
+        .unwrap_or_else(|| "0".to_string());
+    {
+        let mut slot = discord_pairing_slot().lock().map_err(err)?;
+        *slot = Some(DiscordPendingPairing {
+            attempt,
+            code: code.clone(),
+            bot_token: token,
+            bot_username: bot.username,
+            channel_id: channel.id.clone(),
+            after_message_id,
+            guild_name: guild_name.clone(),
+        });
+    }
+    Ok(DiscordBeginPairingResult {
+        attempt,
+        code,
+        channel_id: channel.id,
+        channel_name,
+        guild_name,
+    })
+}
+
+#[tauri::command]
+async fn discord_wait_pairing(attempt: u64) -> Result<DiscordPairResult, String> {
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut saw_any_member_message = false;
+    let mut saw_hidden_content = false;
+    loop {
+        let pending = {
+            let slot = discord_pairing_slot().lock().map_err(err)?;
+            match slot.as_ref() {
+                Some(value) if value.attempt == attempt => value.clone(),
+                _ => return Err("Discord pairing was cancelled".to_string()),
+            }
+        };
+        let poll = async {
+            let response = discord_auth(
+                client.get(discord_url(&format!(
+                    "/channels/{}/messages?after={}&limit=50",
+                    pending.channel_id, pending.after_message_id
+                ))),
+                &pending.bot_token,
+            )
+            .send()
+            .await
+            .map_err(discord_reach)?;
+            discord_json::<Vec<DiscordMessage>>(response, "Discord pairing poll").await
+        }
+        .await;
+        let messages = match poll {
+            Ok(messages) => messages,
+            Err(error) => {
+                // A rejected token cannot recover; network blips, 429s and
+                // 5xx just skip this round and try again until the deadline.
+                if error.contains("rejected the bot token") {
+                    let mut slot = discord_pairing_slot().lock().map_err(err)?;
+                    if slot.as_ref().map(|value| value.attempt) == Some(attempt) {
+                        *slot = None;
+                    }
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    let mut slot = discord_pairing_slot().lock().map_err(err)?;
+                    if slot.as_ref().map(|value| value.attempt) == Some(attempt) {
+                        *slot = None;
+                    }
+                    return Err(format!(
+                        "Discord pairing timed out after 5 minutes. Last Discord error: {error}"
+                    ));
+                }
+                discord_sleep(Duration::from_millis(2500)).await;
+                continue;
+            }
+        };
+        let newest_id = messages.first().map(|message| message.id.clone());
+        let mut matched: Option<(String, DiscordUser)> = None;
+        // Newest first in the response; scan oldest first.
+        for message in messages.iter().rev() {
+            let Some(author) = message.author.as_ref() else {
+                continue;
+            };
+            if author.bot {
+                continue;
+            }
+            saw_any_member_message = true;
+            if message.content.trim().is_empty() {
+                saw_hidden_content = true;
+                continue;
+            }
+            if discord_message_matches_code(&message.content, &pending.code) {
+                matched = Some((message.id.clone(), author.clone()));
+                break;
+            }
+        }
+
+        if let Some((message_id, author)) = matched {
+            // Keep the channel tidy; harmless to fail without Manage Messages.
+            let _ = discord_auth(
+                client.delete(discord_url(&format!(
+                    "/channels/{}/messages/{}",
+                    pending.channel_id, message_id
+                ))),
+                &pending.bot_token,
+            )
+            .send()
+            .await;
+            let display_name = author
+                .global_name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| author.username.clone());
+            let dm = discord_open_dm(&client, &pending.bot_token, &author.id).await?;
+            let confirmation = format!(
+                "✅ **DendroCapture paired!** New captures from this device will be delivered here. Unpair anytime from DendroCapture's Discord settings.{}",
+                pending
+                    .guild_name
+                    .as_deref()
+                    .map(|name| format!("\n_Paired via {}._", discord_plain_text(name)))
+                    .unwrap_or_default()
+            );
+            let _: DiscordMessage = discord_json(
+                discord_auth(
+                    client.post(discord_url(&format!("/channels/{}/messages", dm.id))),
+                    &pending.bot_token,
+                )
+                .json(&json!({ "content": confirmation }))
+                .send()
+                .await
+                .map_err(discord_reach)?,
+                "Discord pairing confirmation DM",
+            )
+            .await
+            .map_err(|error| {
+                format!("Found the pairing code from {display_name}, but the confirmation DM failed: {error}")
+            })?;
+            save_discord_state(&DiscordStoredState {
+                bot_token: pending.bot_token.clone(),
+                bot_username: pending.bot_username.clone(),
+                user_id: author.id.clone(),
+                user_name: display_name.clone(),
+                dm_channel_id: dm.id,
+                guild_name: pending.guild_name.clone(),
+            })?;
+            let mut slot = discord_pairing_slot().lock().map_err(err)?;
+            if slot.as_ref().map(|value| value.attempt) == Some(attempt) {
+                *slot = None;
+            }
+            return Ok(DiscordPairResult {
+                user_name: display_name,
+                user_id: author.id,
+            });
+        }
+
+        if let Some(newest_id) = newest_id {
+            let mut slot = discord_pairing_slot().lock().map_err(err)?;
+            if let Some(value) = slot.as_mut() {
+                if value.attempt == attempt {
+                    value.after_message_id = newest_id;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let mut slot = discord_pairing_slot().lock().map_err(err)?;
+            if slot.as_ref().map(|value| value.attempt) == Some(attempt) {
+                *slot = None;
+            }
+            let hint = if saw_hidden_content {
+                " A message was posted but its text was hidden from the bot. Enable Message Content Intent on the Developer Portal Bot page (or mention the bot in the pairing message), then pair again."
+            } else if !saw_any_member_message {
+                " No member messages were visible in the pairing channel. Check the bot can View Channel and Read Message History there."
+            } else {
+                ""
+            };
+            return Err(format!("Discord pairing timed out after 5 minutes.{hint}"));
+        }
+        discord_sleep(Duration::from_millis(2500)).await;
+    }
+}
+
+#[tauri::command]
+async fn discord_cancel_pairing(attempt: Option<u64>) -> Result<(), String> {
+    let mut slot = discord_pairing_slot().lock().map_err(err)?;
+    match attempt {
+        Some(attempt) => {
+            if slot.as_ref().map(|value| value.attempt) == Some(attempt) {
+                *slot = None;
+            }
+        }
+        None => *slot = None,
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn discord_unlink() -> Result<(), String> {
+    clear_discord_state()
+}
+
+#[tauri::command]
+async fn discord_send_capture(
+    app: AppHandle,
+    bot_token: Option<String>,
+    payload: DiscordSendCapture,
+) -> Result<DiscordSendResult, String> {
+    let state =
+        load_discord_state()?.ok_or_else(|| "Pair Discord before sending captures".to_string())?;
+    // Prefer the token currently in settings: a token reset in the Developer
+    // Portal must take effect without forcing a re-pair.
+    let token = bot_token
+        .as_deref()
+        .and_then(|value| clean_discord_bot_token(value).ok())
+        .unwrap_or_else(|| state.bot_token.clone());
+    let client = reqwest::Client::new();
+    let media_kind = normalized_media_kind(payload.media_kind.as_deref());
+    let mime_type = payload
+        .mime_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| media_mime_type(media_kind))
+        .to_string();
+    let filename = safe_local_media_filename(&payload.filename, media_kind);
+
+    let media_part = if media_kind == "video" {
+        let source_path = payload
+            .file_path
+            .as_deref()
+            .ok_or_else(|| "Video file path is missing".to_string())?;
+        let path = validated_app_data_file_path(&app, source_path)?;
+        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if size > DISCORD_MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "Recording is {:.1} MB, but Discord bot uploads max out around 10 MB. Save it locally or use Google Drive for long recordings.",
+                size as f64 / 1_000_000.0
+            ));
+        }
+        multipart::Part::file(path)
+            .await
+            .map_err(|error| format!("Could not read recording for Discord upload: {error}"))?
+            .file_name(filename.clone())
+            .mime_str(&mime_type)
+            .map_err(err)?
+    } else {
+        let png_base64 = payload
+            .png_base64
+            .as_deref()
+            .ok_or_else(|| "PNG data is missing".to_string())?;
+        let png = BASE64.decode(png_base64.as_bytes()).map_err(err)?;
+        if png.len() as u64 > DISCORD_MAX_UPLOAD_BYTES {
+            return Err(format!(
+                "Capture is {:.1} MB, but Discord bot uploads max out around 10 MB.",
+                png.len() as f64 / 1_000_000.0
+            ));
+        }
+        multipart::Part::bytes(png)
+            .file_name(filename.clone())
+            .mime_str(&mime_type)
+            .map_err(err)?
+    };
+
+    let header = discord_capture_header(
+        media_kind,
+        payload.captured_at_unix,
+        payload.duration_ms,
+        payload.app_name.as_deref(),
+        payload.window_title.as_deref(),
+    );
+    // Always send non-empty content: an attachment-only message is awkward to
+    // grow into text later, and the OCR pass edits this same message in place.
+    let content = if payload.ocr_pending.unwrap_or(false) && media_kind == "image" {
+        format!("{header}\n_Reading text (OCR)…_")
+    } else {
+        header
+    };
+    let payload_json = json!({
+        "content": content,
+        "attachments": [{ "id": 0, "filename": filename }],
+    });
+    let payload_part = multipart::Part::bytes(serde_json::to_vec(&payload_json).map_err(err)?)
+        .mime_str("application/json")
+        .map_err(err)?;
+    let form = multipart::Form::new()
+        .part("payload_json", payload_part)
+        .part("files[0]", media_part);
+
+    // Re-resolving the DM channel each send is one cheap call and self-heals a
+    // stale cached channel; Discord returns the existing DM when there is one.
+    let dm = discord_open_dm(&client, &token, &state.user_id).await?;
+    let message: DiscordMessage = discord_json(
+        discord_auth(
+            client.post(discord_url(&format!("/channels/{}/messages", dm.id))),
+            &token,
+        )
+        .multipart(form)
+        .send()
+        .await
+        .map_err(discord_reach)?,
+        "Discord capture upload",
+    )
+    .await?;
+    let message_url = format!(
+        "https://discord.com/channels/@me/{}/{}",
+        message.channel_id, message.id
+    );
+    Ok(DiscordSendResult {
+        message_id: message.id,
+        channel_id: message.channel_id,
+        message_url,
+    })
+}
+
+#[tauri::command]
+async fn discord_update_capture_ocr(
+    bot_token: Option<String>,
+    payload: DiscordOcrUpdate,
+) -> Result<DiscordOcrUpdateResult, String> {
+    let state = load_discord_state()?
+        .ok_or_else(|| "Pair Discord before updating capture messages".to_string())?;
+    let token = bot_token
+        .as_deref()
+        .and_then(|value| clean_discord_bot_token(value).ok())
+        .unwrap_or_else(|| state.bot_token.clone());
+    let header = discord_capture_header(
+        normalized_media_kind(payload.media_kind.as_deref()),
+        payload.captured_at_unix,
+        payload.duration_ms,
+        payload.app_name.as_deref(),
+        payload.window_title.as_deref(),
+    );
+    let content = if payload.ocr_failed.unwrap_or(false) {
+        format!("{header}\n_OCR could not run for this capture._")
+    } else {
+        discord_content_with_ocr(&header, &payload.ocr_text)
+    };
+    let client = reqwest::Client::new();
+    // Only "content" may be sent here: adding an "attachments" field (or an
+    // empty array) would drop the uploaded file from the message.
+    let response = discord_auth(
+        client.patch(discord_url(&format!(
+            "/channels/{}/messages/{}",
+            urlencoding::encode(&payload.channel_id),
+            urlencoding::encode(&payload.message_id)
+        ))),
+        &token,
+    )
+    .json(&json!({ "content": content }))
+    .send()
+    .await
+    .map_err(discord_reach)?;
+    let _: DiscordMessage = discord_json(response, "Discord OCR update").await?;
+    Ok(DiscordOcrUpdateResult { updated: true })
 }
 
 #[tauri::command]
@@ -3593,6 +4471,13 @@ pub fn run() {
             google_drive_unlink,
             google_drive_upload_capture,
             google_drive_update_capture_ocr,
+            discord_status,
+            discord_begin_pairing,
+            discord_wait_pairing,
+            discord_cancel_pairing,
+            discord_unlink,
+            discord_send_capture,
+            discord_update_capture_ocr,
             capture_monitor_previews,
             capture_display,
             begin_area_capture,

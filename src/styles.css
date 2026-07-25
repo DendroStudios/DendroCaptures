@@ -1898,6 +1898,49 @@ kbd {
   background: rgba(255, 200, 87, 0.06);
 }
 
+.dc-discord-pairing {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px dashed rgba(88, 101, 242, 0.55);
+  border-radius: var(--radius-sm);
+  background: rgba(88, 101, 242, 0.08);
+}
+
+.dc-discord-code {
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+  padding: 7px 11px;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.3);
+  color: #c7d2fe;
+  user-select: text;
+  white-space: nowrap;
+}
+
+.dc-discord-pairing-copy {
+  min-width: 0;
+}
+
+.dc-discord-pairing-copy strong,
+.dc-discord-pairing-copy small {
+  min-width: 0;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dc-discord-pairing-copy small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .dc-drive-help {
   display: grid;
   gap: 12px;

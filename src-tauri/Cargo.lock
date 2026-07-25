@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "dendro_capture"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "arboard",
  "base64 0.22.1",

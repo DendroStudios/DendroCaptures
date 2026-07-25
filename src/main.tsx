@@ -11,6 +11,7 @@ import { AnnotationEditor, type AnnotationSavePayload } from './annotationEditor
 import {
   Aperture,
   AlertTriangle,
+  Bot,
   Brush,
   ChevronRight,
   CheckCircle2,
@@ -46,9 +47,9 @@ type CaptureMode = 'area' | 'fullscreen';
 type CaptureMediaKind = 'image' | 'video';
 type AppTab = 'capture' | 'history' | 'queue' | 'settings';
 type ShortcutField = 'areaShortcut' | 'fullscreenShortcut' | 'videoAreaShortcut' | 'videoFullscreenShortcut';
-type CaptureDestination = 'local' | 'dendroApi' | 'googleDrive';
-type UploadDestination = 'dendroApi' | 'googleDrive';
-type SettingsSection = 'destination' | 'local' | 'dendroApi' | 'googleDrive' | 'capture';
+type CaptureDestination = 'local' | 'dendroApi' | 'googleDrive' | 'discord';
+type UploadDestination = 'dendroApi' | 'googleDrive' | 'discord';
+type SettingsSection = 'destination' | 'local' | 'dendroApi' | 'googleDrive' | 'discord' | 'capture';
 
 interface NativeCapture {
   pngBase64: string;
@@ -107,6 +108,9 @@ interface CaptureSettings {
   googleDriveOcrEnabled: boolean;
   googleDriveClientId: string;
   googleDriveClientSecret: string;
+  discordBotToken: string;
+  discordOcrEnabled: boolean;
+  discordPairingChannelId: string;
   launchOnStartup: boolean;
 }
 
@@ -133,6 +137,9 @@ interface PendingCapture {
   googleDriveFileId?: string;
   googleDriveUrl?: string;
   googleDriveFolderUrl?: string;
+  discordMessageId?: string;
+  discordChannelId?: string;
+  discordMessageUrl?: string;
 }
 
 type UploadableCapture = PendingCapture & { pngBase64?: string };
@@ -175,6 +182,44 @@ interface GoogleDriveUploadResult {
   webViewLink?: string | null;
   folderViewLink?: string | null;
   ocrIndexed: boolean;
+}
+
+interface DiscordStatus {
+  configured: boolean;
+  paired: boolean;
+  botUsername?: string | null;
+  userName?: string | null;
+  userId?: string | null;
+  guildName?: string | null;
+}
+
+interface DiscordBeginPairingResult {
+  attempt: number;
+  code: string;
+  channelId: string;
+  channelName: string;
+  guildName?: string | null;
+}
+
+interface DiscordPairResult {
+  userName: string;
+  userId: string;
+}
+
+interface DiscordSendResult {
+  messageId: string;
+  channelId: string;
+  messageUrl: string;
+}
+
+interface DiscordOcrUpdateResult {
+  updated: boolean;
+}
+
+interface DiscordPairingUi {
+  code: string;
+  channelName: string;
+  guildName?: string | null;
 }
 
 interface CaptureFileInfo {
@@ -264,7 +309,7 @@ interface CaptureCancelPayload {
   restoreWindow?: boolean;
 }
 
-const APP_VERSION = '0.1.66';
+const APP_VERSION = '0.1.67';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
@@ -280,6 +325,7 @@ const MIN_APP_WIDTH = 780;
 const MIN_APP_HEIGHT = 480;
 const MAX_APP_WIDTH = 1120;
 const MAX_APP_HEIGHT = 720;
+const WINDOW_RESUME_GAP_MS = 8_000;
 const MEDIA_FULLSCREEN_CLASS = 'dc-media-fullscreen-active';
 const DEFAULT_AREA_SHORTCUT = 'Ctrl+Alt+C';
 const OLD_DEFAULT_AREA_SHORTCUT = 'Alt+Shift+4';
@@ -293,6 +339,10 @@ const GOOGLE_AUTH_CLIENTS_URL = 'https://console.cloud.google.com/auth/clients';
 const GOOGLE_AUTH_AUDIENCE_URL = 'https://console.cloud.google.com/auth/audience';
 const GOOGLE_CREDENTIALS_DOCS_URL = 'https://developers.google.com/workspace/guides/create-credentials';
 const DENDRO_STUDIOS_CAPTURES_URL = 'https://dendrostudios.com/admin/?tab=toolkit&tool=captures';
+const DISCORD_DEVELOPER_PORTAL_URL = 'https://discord.com/developers/applications';
+const DISCORD_PAIRING_CHANNEL = 'dendrocapture-pairing';
+// Discord caps bot attachments at 10 MiB; keep headroom for the envelope.
+const DISCORD_MAX_UPLOAD_BYTES = 10_000_000;
 
 const defaultSettings: CaptureSettings = {
   apiBaseUrl: 'http://localhost:3001/api',
@@ -315,6 +365,9 @@ const defaultSettings: CaptureSettings = {
   googleDriveOcrEnabled: true,
   googleDriveClientId: '',
   googleDriveClientSecret: '',
+  discordBotToken: '',
+  discordOcrEnabled: true,
+  discordPairingChannelId: '',
   launchOnStartup: true,
 };
 
@@ -402,7 +455,7 @@ const loadSettings = (): CaptureSettings => {
     ? bool(raw.openAfterUpload, defaultSettings.openAfterUpload)
     : false;
   const rawDestination = typeof raw.captureDestination === 'string' ? raw.captureDestination : '';
-  const captureDestination: CaptureDestination = rawDestination === 'dendroApi' || rawDestination === 'googleDrive' || rawDestination === 'local'
+  const captureDestination: CaptureDestination = rawDestination === 'dendroApi' || rawDestination === 'googleDrive' || rawDestination === 'discord' || rawDestination === 'local'
     ? rawDestination
     : raw.googleDriveUploadEnabled === true
       ? 'googleDrive'
@@ -430,6 +483,9 @@ const loadSettings = (): CaptureSettings => {
     googleDriveOcrEnabled: bool(raw.googleDriveOcrEnabled, defaultSettings.googleDriveOcrEnabled),
     googleDriveClientId: str(raw.googleDriveClientId, defaultSettings.googleDriveClientId),
     googleDriveClientSecret: str(raw.googleDriveClientSecret, defaultSettings.googleDriveClientSecret),
+    discordBotToken: str(raw.discordBotToken, defaultSettings.discordBotToken),
+    discordOcrEnabled: bool(raw.discordOcrEnabled, defaultSettings.discordOcrEnabled),
+    discordPairingChannelId: str(raw.discordPairingChannelId, defaultSettings.discordPairingChannelId),
     launchOnStartup: bool(raw.launchOnStartup, defaultSettings.launchOnStartup),
   };
   return {
@@ -541,7 +597,9 @@ const loadPendingQueue = (): PendingCapture[] =>
     .map((item) => {
       const mode: CaptureMode = item.mode === 'fullscreen' ? 'fullscreen' : 'area';
       const mediaKind: CaptureMediaKind = item.mediaKind === 'video' ? 'video' : 'image';
-      const destination: UploadDestination = item.destination === 'googleDrive' ? 'googleDrive' : 'dendroApi';
+      const destination: UploadDestination = item.destination === 'googleDrive' || item.destination === 'discord'
+        ? item.destination
+        : 'dendroApi';
       return {
         id: String(item.id),
         mode,
@@ -567,6 +625,9 @@ const loadPendingQueue = (): PendingCapture[] =>
         googleDriveFileId: typeof item.googleDriveFileId === 'string' ? item.googleDriveFileId : undefined,
         googleDriveUrl: typeof item.googleDriveUrl === 'string' ? item.googleDriveUrl : undefined,
         googleDriveFolderUrl: typeof item.googleDriveFolderUrl === 'string' ? item.googleDriveFolderUrl : undefined,
+        discordMessageId: typeof item.discordMessageId === 'string' ? item.discordMessageId : undefined,
+        discordChannelId: typeof item.discordChannelId === 'string' ? item.discordChannelId : undefined,
+        discordMessageUrl: typeof item.discordMessageUrl === 'string' ? item.discordMessageUrl : undefined,
       };
     })
     .slice(0, 20);
@@ -739,13 +800,15 @@ const captureDestinationLabel = (destination: CaptureDestination): string => {
       return 'Dendro API';
     case 'googleDrive':
       return 'Google Drive';
+    case 'discord':
+      return 'Discord';
     default:
       return 'Local';
   }
 };
 
-const onlineImageUrl = (capture?: Pick<PendingCapture, 'assetUrl' | 'googleDriveUrl' | 'googleDriveFolderUrl'> | null): string | undefined =>
-  capture?.assetUrl || capture?.googleDriveUrl || capture?.googleDriveFolderUrl || undefined;
+const onlineImageUrl = (capture?: Pick<PendingCapture, 'assetUrl' | 'googleDriveUrl' | 'googleDriveFolderUrl' | 'discordMessageUrl'> | null): string | undefined =>
+  capture?.assetUrl || capture?.googleDriveUrl || capture?.googleDriveFolderUrl || capture?.discordMessageUrl || undefined;
 
 const googleDriveFolderUrl = (folderId?: string | null): string | undefined =>
   folderId ? `https://drive.google.com/drive/u/0/folders/${encodeURIComponent(folderId)}` : undefined;
@@ -1290,6 +1353,11 @@ const DendroCaptureApp = () => {
     configured: false,
     linked: false,
   });
+  const [discord, setDiscord] = useState<DiscordStatus>({
+    configured: false,
+    paired: false,
+  });
+  const [discordPairing, setDiscordPairing] = useState<DiscordPairingUi | null>(null);
   const [pending, setPending] = useState<PendingCapture[]>(loadPendingQueue);
   // History is restored from the local-captures folder on boot (see the
   // list_local_captures effect below) and updated in memory afterwards.
@@ -1315,6 +1383,7 @@ const DendroCaptureApp = () => {
   const settingsRef = useRef(settings);
   const deviceRef = useRef(device);
   const googleDriveRef = useRef(googleDrive);
+  const discordRef = useRef(discord);
   const busyRef = useRef<string | null>(busy);
   const fitWindowTimerRef = useRef<number | null>(null);
   // Last physical size we intentionally applied; lets the resize watchdog
@@ -1329,6 +1398,7 @@ const DendroCaptureApp = () => {
   const shortcutOpsRef = useRef<Promise<void>>(Promise.resolve());
   const editingCaptureRef = useRef(false);
   const googleDriveLinkAttemptRef = useRef(0);
+  const discordPairAttemptRef = useRef(0);
   const activeCaptureContextRef = useRef<CaptureWindowContext | null>(null);
   const lastExternalContextRef = useRef<CaptureWindowContext | null>(null);
   const transientPreviewFileRef = useRef<{ id: string; filePath: string } | null>(null);
@@ -1358,17 +1428,35 @@ const DendroCaptureApp = () => {
   // the monitor's: when the window straddles screens or a DPI change is still
   // settling, the two disagree, and sizing from the monitor's value leaves
   // the CSS viewport smaller than the layout minimum - the "cut off" window.
-  const applyWindowSizeForMonitor = useCallback(async (logicalWidth: number, logicalHeight: number, monitor: Awaited<ReturnType<typeof currentMonitor>>) => {
+  const applyWindowSizeForMonitor = useCallback(async (
+    logicalWidth: number,
+    logicalHeight: number,
+    monitor: Awaited<ReturnType<typeof currentMonitor>>,
+    forceWebviewRefresh = false
+  ) => {
     const win = getCurrentWindow();
-    const applyOnce = async () => {
+    const applyOnce = async (forceRefresh = false) => {
       const windowScale = await win.scaleFactor().catch(() => 0);
       const scaleFactor = windowScale || monitor?.scaleFactor || 1;
       const physicalWidth = Math.round(logicalWidth * scaleFactor);
       const physicalHeight = Math.round(logicalHeight * scaleFactor);
+      // After Windows wakes, WebView2 can keep its pre-sleep composition
+      // bounds even though Tauri and the DOM both report plausible sizes.
+      // Setting the same size is optimized away, so briefly change it by one
+      // physical pixel to force the native child surface to be laid out.
+      if (forceRefresh) {
+        const refreshSize = {
+          width: physicalWidth + 1,
+          height: physicalHeight + 1,
+        };
+        lastFitSizeRef.current = refreshSize;
+        await win.setSize(new PhysicalSize(refreshSize.width, refreshSize.height)).catch(() => undefined);
+        await wait(32);
+      }
       lastFitSizeRef.current = { width: physicalWidth, height: physicalHeight };
       await win.setSize(new PhysicalSize(physicalWidth, physicalHeight)).catch(() => undefined);
     };
-    await applyOnce();
+    await applyOnce(forceWebviewRefresh);
     // Verify against the CSS viewport, the ground truth for "content is cut":
     // if Windows rescaled the window between reading the scale factor and the
     // resize landing, re-apply once with the fresh value.
@@ -1378,7 +1466,7 @@ const DendroCaptureApp = () => {
       && (Math.abs(window.innerWidth - logicalWidth) > 3
         || Math.abs(window.innerHeight - logicalHeight) > 3)
     ) {
-      await applyOnce();
+      await applyOnce(true);
     }
     if (!monitor) return;
     // Keep the whole window inside the monitor's work area; a resize near an
@@ -1396,7 +1484,7 @@ const DendroCaptureApp = () => {
     }
   }, []);
 
-  const fitWindowToCurrentMonitor = useCallback(async () => {
+  const fitWindowToCurrentMonitor = useCallback(async (forceWebviewRefresh = false) => {
     if (isMediaFullscreenActive()) return;
     const win = getCurrentWindow();
     const isWindowFullscreen = await win.isFullscreen().catch(() => false);
@@ -1409,10 +1497,10 @@ const DendroCaptureApp = () => {
     const width = Math.round(clampNumber(Math.min(workWidth - 32, workWidth * 0.62), MIN_APP_WIDTH, MAX_APP_WIDTH));
     const height = Math.round(clampNumber(Math.min(workHeight - 32, workHeight * 0.68), MIN_APP_HEIGHT, MAX_APP_HEIGHT));
     await win.setResizable(false).catch(() => undefined);
-    await applyWindowSizeForMonitor(width, height, monitor);
+    await applyWindowSizeForMonitor(width, height, monitor, forceWebviewRefresh);
   }, [applyWindowSizeForMonitor]);
 
-  const enlargeWindowForEditor = useCallback(async () => {
+  const enlargeWindowForEditor = useCallback(async (forceWebviewRefresh = false) => {
     const win = getCurrentWindow();
     const monitor = await currentMonitor().catch(() => null);
     const scaleFactor = monitor?.scaleFactor || 1;
@@ -1420,7 +1508,7 @@ const DendroCaptureApp = () => {
     const workHeight = monitor ? monitor.workArea.size.height / scaleFactor : 900;
     const width = Math.round(Math.max(MIN_APP_WIDTH, Math.min(workWidth - 48, 1480)));
     const height = Math.round(Math.max(MIN_APP_HEIGHT, Math.min(workHeight - 48, 940)));
-    await applyWindowSizeForMonitor(width, height, monitor);
+    await applyWindowSizeForMonitor(width, height, monitor, forceWebviewRefresh);
     await win.center().catch(() => undefined);
   }, [applyWindowSizeForMonitor]);
 
@@ -1462,14 +1550,32 @@ const DendroCaptureApp = () => {
     let unlistenMoved: (() => void) | null = null;
     let unlistenScale: (() => void) | null = null;
     let unlistenResized: (() => void) | null = null;
+    let unlistenFocus: (() => void) | null = null;
+    let lastFocusLostAt = Date.now();
+    let hiddenAt: number | null = document.hidden ? Date.now() : null;
 
-    const scheduleFit = (delayMs: number) => {
+    const scheduleFit = (delayMs: number, forceWebviewRefresh = false) => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
       fitWindowTimerRef.current = window.setTimeout(() => {
         fitWindowTimerRef.current = null;
-        if (editingCaptureRef.current || isMediaFullscreenActive()) return;
-        void fitWindowToCurrentMonitor();
+        if (isMediaFullscreenActive()) return;
+        if (editingCaptureRef.current) {
+          void enlargeWindowForEditor(forceWebviewRefresh);
+        } else {
+          void fitWindowToCurrentMonitor(forceWebviewRefresh);
+        }
       }, delayMs);
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        hiddenAt = Date.now();
+        return;
+      }
+      if (hiddenAt !== null && Date.now() - hiddenAt >= WINDOW_RESUME_GAP_MS) {
+        scheduleFit(120, true);
+      }
+      hiddenAt = null;
     };
 
     if (!isMediaFullscreenActive()) void fitWindowToCurrentMonitor();
@@ -1493,14 +1599,31 @@ const DendroCaptureApp = () => {
     }).then((unlisten) => {
       unlistenResized = unlisten;
     }).catch(() => undefined);
+    // A long blur is the normal taskbar/tray restoration path. Windows resume
+    // can reactivate an already-visible HWND without a resize or DPI event, so
+    // force the WebView2 child surface through a real native layout here.
+    void win.onFocusChanged((event) => {
+      if (!event.payload) {
+        lastFocusLostAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastFocusLostAt >= WINDOW_RESUME_GAP_MS) {
+        scheduleFit(120, true);
+      }
+    }).then((unlisten) => {
+      unlistenFocus = unlisten;
+    }).catch(() => undefined);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       if (fitWindowTimerRef.current !== null) window.clearTimeout(fitWindowTimerRef.current);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       unlistenMoved?.();
       unlistenScale?.();
       unlistenResized?.();
+      unlistenFocus?.();
     };
-  }, [fitWindowToCurrentMonitor]);
+  }, [enlargeWindowForEditor, fitWindowToCurrentMonitor]);
 
   useEffect(() => {
     let unlistenClose: (() => void) | null = null;
@@ -1545,6 +1668,10 @@ const DendroCaptureApp = () => {
   useEffect(() => {
     googleDriveRef.current = googleDrive;
   }, [googleDrive]);
+
+  useEffect(() => {
+    discordRef.current = discord;
+  }, [discord]);
 
   useEffect(() => {
     deviceRef.current = device;
@@ -1598,6 +1725,9 @@ const DendroCaptureApp = () => {
               googleDriveFileId: typeof meta.googleDriveFileId === 'string' ? meta.googleDriveFileId : undefined,
               googleDriveUrl: typeof meta.googleDriveUrl === 'string' ? meta.googleDriveUrl : undefined,
               googleDriveFolderUrl: typeof meta.googleDriveFolderUrl === 'string' ? meta.googleDriveFolderUrl : undefined,
+              discordMessageId: typeof meta.discordMessageId === 'string' ? meta.discordMessageId : undefined,
+              discordChannelId: typeof meta.discordChannelId === 'string' ? meta.discordChannelId : undefined,
+              discordMessageUrl: typeof meta.discordMessageUrl === 'string' ? meta.discordMessageUrl : undefined,
               filePath: record.filePath,
             });
           } catch {
@@ -1652,6 +1782,25 @@ const DendroCaptureApp = () => {
     void refreshGoogleDriveStatus();
   }, [refreshGoogleDriveStatus, settings.googleDriveClientId, settings.googleDriveClientSecret]);
 
+  const refreshDiscordStatus = useCallback(async () => {
+    try {
+      const status = await invoke<DiscordStatus>('discord_status', {
+        botToken: settingsRef.current.discordBotToken.trim() || null,
+      });
+      setDiscord(status);
+      return status;
+    } catch (error) {
+      console.warn('Could not read Discord status', error);
+      const fallback = { configured: false, paired: false } satisfies DiscordStatus;
+      setDiscord(fallback);
+      return fallback;
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDiscordStatus();
+  }, [refreshDiscordStatus, settings.discordBotToken]);
+
   const updateSettings = (patch: Partial<CaptureSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
   };
@@ -1668,8 +1817,12 @@ const DendroCaptureApp = () => {
       setStatus('Google Drive selected. Paste the OAuth desktop Client ID and Client Secret to link it.');
     } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
       setStatus('Google Drive selected. Link your account before captures upload there.');
+    } else if (destination === 'discord' && !settingsRef.current.discordBotToken.trim() && !discordRef.current.paired) {
+      setStatus('Discord selected. Paste the bot token, then pair your Discord account.');
+    } else if (destination === 'discord' && !discordRef.current.paired) {
+      setStatus('Discord selected. Pair your Discord account before captures are sent there.');
     } else {
-      setStatus(`Capture destination set to ${destination === 'local' ? 'Local' : destination === 'dendroApi' ? 'Dendro API' : 'Google Drive'}`);
+      setStatus(`Capture destination set to ${captureDestinationLabel(destination)}`);
     }
   };
 
@@ -1739,6 +1892,90 @@ const DendroCaptureApp = () => {
       setStatus('Google Drive unlinked');
     } catch (error) {
       setStatus(errorMessage(error, 'Could not unlink Google Drive'));
+    } finally {
+      busyRef.current = null;
+      setBusy(null);
+    }
+  };
+
+  const pairDiscord = async () => {
+    if (busyRef.current && busyRef.current !== 'discord-pair') return;
+    const botToken = settingsRef.current.discordBotToken.trim();
+    if (!botToken) {
+      setStatus('Paste the Discord bot token first');
+      return;
+    }
+    const attemptId = discordPairAttemptRef.current + 1;
+    discordPairAttemptRef.current = attemptId;
+    busyRef.current = 'discord-pair';
+    setBusy('discord-pair');
+    setDiscordPairing(null);
+    setStatus('Contacting Discord');
+    try {
+      const begun = await withTimeout(
+        invoke<DiscordBeginPairingResult>('discord_begin_pairing', {
+          botToken,
+          pairingChannelId: settingsRef.current.discordPairingChannelId.trim() || null,
+        }),
+        30_000,
+        'Discord did not answer. Check the bot token and your connection, then try again.',
+      );
+      if (discordPairAttemptRef.current !== attemptId) return;
+      setDiscordPairing({
+        code: begun.code,
+        channelName: begun.channelName,
+        guildName: begun.guildName,
+      });
+      setStatus(`Post the pairing code in #${begun.channelName} on Discord`);
+      const paired = await withTimeout(
+        invoke<DiscordPairResult>('discord_wait_pairing', { attempt: begun.attempt }),
+        330_000,
+        'Discord pairing timed out. Click Pair Discord to try again.',
+      );
+      if (discordPairAttemptRef.current !== attemptId) return;
+      setDiscordPairing(null);
+      updateSettings({ captureDestination: 'discord' });
+      await refreshDiscordStatus();
+      setStatus(`Discord paired with ${paired.userName}. Captures now go to their DMs.`);
+    } catch (error) {
+      if (discordPairAttemptRef.current !== attemptId) return;
+      setDiscordPairing(null);
+      void invoke('discord_cancel_pairing', { attempt: null }).catch(() => undefined);
+      setStatus(errorMessage(error, 'Could not pair Discord'));
+      await refreshDiscordStatus();
+    } finally {
+      if (discordPairAttemptRef.current === attemptId) {
+        busyRef.current = null;
+        setBusy(null);
+      }
+    }
+  };
+
+  const cancelDiscordPairing = () => {
+    discordPairAttemptRef.current += 1;
+    setDiscordPairing(null);
+    void invoke('discord_cancel_pairing', { attempt: null }).catch(() => undefined);
+    busyRef.current = null;
+    setBusy(null);
+    setStatus('Discord pairing cancelled');
+  };
+
+  const unpairDiscord = async () => {
+    if (busyRef.current) return;
+    busyRef.current = 'discord-unpair';
+    setBusy('discord-unpair');
+    setStatus('Unpairing Discord');
+    try {
+      await invoke('discord_unlink');
+      // Only fall back to Local when Discord was the active destination.
+      setSettings((current) => ({
+        ...current,
+        captureDestination: current.captureDestination === 'discord' ? 'local' : current.captureDestination,
+      }));
+      await refreshDiscordStatus();
+      setStatus('Discord unpaired');
+    } catch (error) {
+      setStatus(errorMessage(error, 'Could not unpair Discord'));
     } finally {
       busyRef.current = null;
       setBusy(null);
@@ -1881,10 +2118,14 @@ const DendroCaptureApp = () => {
   };
 
   const queueDestination = (capture: Pick<PendingCapture, 'destination'>): UploadDestination =>
-    capture.destination === 'googleDrive' ? 'googleDrive' : 'dendroApi';
+    capture.destination === 'googleDrive' || capture.destination === 'discord'
+      ? capture.destination
+      : 'dendroApi';
 
-  const queueDestinationLabel = (capture: Pick<PendingCapture, 'destination'>): string =>
-    queueDestination(capture) === 'googleDrive' ? 'Google Drive' : 'Dendro API';
+  const queueDestinationLabel = (capture: Pick<PendingCapture, 'destination'>): string => {
+    const destination = queueDestination(capture);
+    return destination === 'googleDrive' ? 'Google Drive' : destination === 'discord' ? 'Discord' : 'Dendro API';
+  };
 
   const addPending = (capture: PendingCapture) => {
     const destination = queueDestination(capture);
@@ -2088,6 +2329,43 @@ const DendroCaptureApp = () => {
         setStatus(queuedForRetry
           ? `Edited capture queued for Google Drive: ${errorMessage(error, 'Upload failed')}`
           : `Edited Google Drive upload failed: ${errorMessage(error, 'Upload failed')}`);
+      }
+      return;
+    }
+
+    if (destination === 'discord' && discordCanUpload()) {
+      const uploadItem: PendingCapture = { ...target, destination: 'discord' };
+      const oversize = await discordOversizeError(uploadItem, pngBase64);
+      if (oversize) {
+        setEditingCapture(null);
+        setStatus(`Discord skipped: ${oversize}`);
+        return;
+      }
+      let queuedForRetry = false;
+      if (settingsRef.current.saveLocally) {
+        await invoke('save_pending_capture', { id: uploadItem.id, pngBase64 }).catch((error) => {
+          console.warn('Could not persist edited Discord pending capture', error);
+        });
+        addPending(uploadItem);
+        queuedForRetry = true;
+      }
+      setEditingCapture(null);
+      setStatus('Sending edited capture to Discord');
+      try {
+        const sent = await uploadCaptureToDiscord({ ...uploadItem, pngBase64 });
+        const sentItem = {
+          ...uploadItem,
+          discordMessageId: sent.messageId,
+          discordChannelId: sent.channelId,
+          discordMessageUrl: sent.messageUrl,
+        };
+        setLastCapture(sentItem);
+        updateCaptureRecord(sentItem);
+        setStatus('Edited capture sent to Discord');
+      } catch (error) {
+        setStatus(queuedForRetry
+          ? `Edited capture queued for Discord: ${errorMessage(error, 'Send failed')}`
+          : `Edited Discord send failed: ${errorMessage(error, 'Send failed')}`);
       }
       return;
     }
@@ -2363,6 +2641,128 @@ const DendroCaptureApp = () => {
     return result;
   };
 
+  const discordCanUpload = (): boolean =>
+    settingsRef.current.captureDestination === 'discord' && discordRef.current.paired;
+
+  const capturedAtUnixOf = (capturedAt: string): number | undefined => {
+    const parsed = Date.parse(capturedAt);
+    return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : undefined;
+  };
+
+  // The 10 MB bot limit is a permanent failure: checked before queueing so an
+  // oversized capture never becomes a retry entry that can only fail forever.
+  const discordOversizeError = async (capture: PendingCapture, pngBase64?: string): Promise<string | null> => {
+    try {
+      if (isVideoCapture(capture)) {
+        if (!capture.filePath) return null;
+        const info = await invoke<CaptureFileInfo>('capture_file_info', { path: capture.filePath });
+        if (info.size > DISCORD_MAX_UPLOAD_BYTES) {
+          return `recording is ${(info.size / 1_000_000).toFixed(1)} MB and Discord bot uploads max out around 10 MB`;
+        }
+      } else if (pngBase64 && pngBase64.length * 0.75 > DISCORD_MAX_UPLOAD_BYTES) {
+        return `capture is ${((pngBase64.length * 0.75) / 1_000_000).toFixed(1)} MB and Discord bot uploads max out around 10 MB`;
+      }
+    } catch {
+      // Size probe failures fall through to the real send, which checks again.
+    }
+    return null;
+  };
+
+  const updateDiscordOcrMessage = async (
+    capture: UploadableCapture,
+    pngBase64: string,
+    sent: DiscordSendResult,
+  ): Promise<void> => {
+    if (isVideoCapture(capture)) return;
+    if (!settingsRef.current.discordOcrEnabled) return;
+    try {
+      setStatus('Discord message sent, OCR running in background');
+      const ocrText = await recognizeCaptureText(pngBase64);
+      // Always edit, even without text: the sent message shows an
+      // "OCR in progress" placeholder that must be replaced either way.
+      const result = await invoke<DiscordOcrUpdateResult>('discord_update_capture_ocr', {
+        botToken: settingsRef.current.discordBotToken.trim() || null,
+        payload: {
+          messageId: sent.messageId,
+          channelId: sent.channelId,
+          capturedAtUnix: capturedAtUnixOf(capture.capturedAt),
+          durationMs: capture.durationMs,
+          mediaKind: mediaKindForCapture(capture),
+          appName: capture.appName,
+          windowTitle: capture.windowTitle,
+          ocrText: ocrText || '',
+        },
+      });
+      setStatus(!result.updated
+        ? 'Discord message sent'
+        : ocrText
+          ? 'Discord message updated with OCR text'
+          : 'Discord message updated, OCR found no text');
+    } catch (error) {
+      console.warn('Discord background OCR failed', error);
+      setStatus(`Discord message sent, OCR skipped: ${errorMessage(error, 'OCR failed')}`);
+      // Clear the "Reading text (OCR)…" placeholder so the DM does not
+      // advertise an OCR pass that will never arrive.
+      void invoke('discord_update_capture_ocr', {
+        botToken: settingsRef.current.discordBotToken.trim() || null,
+        payload: {
+          messageId: sent.messageId,
+          channelId: sent.channelId,
+          capturedAtUnix: capturedAtUnixOf(capture.capturedAt),
+          durationMs: capture.durationMs,
+          mediaKind: mediaKindForCapture(capture),
+          appName: capture.appName,
+          windowTitle: capture.windowTitle,
+          ocrText: '',
+          ocrFailed: true,
+        },
+      }).catch(() => undefined);
+    }
+  };
+
+  const uploadCaptureToDiscord = async (
+    capture: UploadableCapture,
+  ): Promise<DiscordSendResult> => {
+    if (settingsRef.current.captureDestination !== 'discord') {
+      throw new Error('Discord is not selected as the capture destination');
+    }
+    if (!discordRef.current.paired) {
+      throw new Error('Pair Discord before sending captures');
+    }
+    const mediaKind = mediaKindForCapture(capture);
+    const mimeType = mimeTypeForCapture(capture);
+    let pngBase64: string | undefined;
+    let filePath = capture.filePath;
+    if (mediaKind === 'video') {
+      if (!filePath) {
+        const info = await invoke<CaptureFileInfo>('pending_capture_file_info', { id: capture.id, mediaKind: 'video' });
+        filePath = info.filePath;
+      }
+    } else {
+      pngBase64 = capture.pngBase64 || await invoke<string>('read_pending_capture', { id: capture.id });
+    }
+    setStatus(mediaKind === 'video' ? 'Sending recording to Discord' : 'Sending capture to Discord');
+    const result = await invoke<DiscordSendResult>('discord_send_capture', {
+      botToken: settingsRef.current.discordBotToken.trim() || null,
+      payload: {
+        filename: captureFileName(new Date(capture.capturedAt), capture),
+        mediaKind,
+        mimeType,
+        filePath,
+        pngBase64,
+        capturedAtUnix: capturedAtUnixOf(capture.capturedAt),
+        durationMs: capture.durationMs,
+        appName: capture.appName,
+        windowTitle: capture.windowTitle,
+        ocrPending: mediaKind === 'image' && settingsRef.current.discordOcrEnabled,
+      },
+    });
+    removePending(capture.id, 'discord');
+    await openOnlineImage(result.messageUrl);
+    if (pngBase64) void updateDiscordOcrMessage(capture, pngBase64, result);
+    return result;
+  };
+
   const processCapture = async (mode: CaptureMode, capture: NativeCapture, context?: CaptureWindowContext | null) => {
     const now = new Date();
     const cleanContext = cleanCaptureContext(context);
@@ -2400,6 +2800,7 @@ const DendroCaptureApp = () => {
     const pairedForUpload = hasPairedDevice(deviceRef.current);
     const canSendToApi = destination === 'dendroApi' && pairedForUpload && settingsRef.current.apiSendingEnabled;
     const canSendToDrive = googleDriveCanUpload();
+    const canSendToDiscord = discordCanUpload();
     const shouldSaveLocally = settingsRef.current.saveLocally;
     let workingItem: LocalCapture = queuedItem;
     let localSaveError: string | null = null;
@@ -2426,7 +2827,7 @@ const DendroCaptureApp = () => {
       }
     }
 
-    if (!canSendToApi && !canSendToDrive) {
+    if (!canSendToApi && !canSendToDrive && !canSendToDiscord) {
       if (localSaveError) {
         setStatus(`Copied PNG, local save failed: ${localSaveError}`);
       } else if (localSaved) {
@@ -2439,6 +2840,8 @@ const DendroCaptureApp = () => {
         setStatus('Copied PNG. Paste a Google OAuth Client ID and Client Secret to enable Google Drive.');
       } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
         setStatus('Copied PNG. Link Google Drive before captures upload there.');
+      } else if (destination === 'discord' && !discordRef.current.paired) {
+        setStatus('Copied PNG. Pair Discord before captures are sent there.');
       } else {
         setStatus('Copied PNG to clipboard');
       }
@@ -2498,6 +2901,31 @@ const DendroCaptureApp = () => {
       }
     }
 
+    if (canSendToDiscord) {
+      const discordItem: PendingCapture = { ...workingItem, destination: 'discord' };
+      const oversize = await discordOversizeError(discordItem, capture.pngBase64);
+      if (oversize) {
+        outcomes.push(`Discord skipped: ${oversize}`);
+      } else {
+        const queuedForRetry = await persistRetryCapture(discordItem);
+        try {
+          const sent = await uploadCaptureToDiscord({ ...discordItem, pngBase64: capture.pngBase64 });
+          const sentItem = {
+            ...workingItem,
+            discordMessageId: sent.messageId,
+            discordChannelId: sent.channelId,
+            discordMessageUrl: sent.messageUrl,
+          };
+          workingItem = sentItem;
+          setLastCapture(sentItem);
+          updateCaptureRecord(sentItem);
+          outcomes.push('sent to Discord');
+        } catch (error) {
+          outcomes.push(queuedForRetry ? 'queued for Discord' : `Discord failed: ${errorMessage(error, 'Send failed')}`);
+        }
+      }
+    }
+
     const localPrefix = localSaveError
       ? `Local save failed: ${localSaveError}. `
       : localSaved
@@ -2542,6 +2970,7 @@ const DendroCaptureApp = () => {
     const pairedForUpload = hasPairedDevice(deviceRef.current);
     const canSendToApi = destination === 'dendroApi' && pairedForUpload && settingsRef.current.apiSendingEnabled;
     const canSendToDrive = googleDriveCanUpload();
+    const canSendToDiscord = discordCanUpload();
     const shouldSaveLocally = settingsRef.current.saveLocally;
     let workingItem: LocalCapture = item;
     let localSaveError: string | null = null;
@@ -2569,7 +2998,7 @@ const DendroCaptureApp = () => {
       }
     }
 
-    if (!canSendToApi && !canSendToDrive) {
+    if (!canSendToApi && !canSendToDrive && !canSendToDiscord) {
       if (!shouldSaveLocally) {
         await deleteTransientCaptureFile(workingItem, { preservePreview: true });
       }
@@ -2581,6 +3010,8 @@ const DendroCaptureApp = () => {
         setStatus('Recording ready. Pair DendroCapture before uploading to Dendro API.');
       } else if (destination === 'googleDrive' && !googleDriveRef.current.linked) {
         setStatus('Recording ready. Link Google Drive before recordings upload there.');
+      } else if (destination === 'discord' && !discordRef.current.paired) {
+        setStatus('Recording ready. Pair Discord before recordings are sent there.');
       } else {
         setStatus('Recording ready');
       }
@@ -2632,6 +3063,32 @@ const DendroCaptureApp = () => {
       }
     }
 
+    if (canSendToDiscord) {
+      const discordItem: PendingCapture = { ...workingItem, destination: 'discord' };
+      const oversize = await discordOversizeError(discordItem);
+      if (oversize) {
+        outcomes.push(`Discord skipped: ${oversize}`);
+      } else {
+        const queuedForRetry = await persistRetryRecording(discordItem);
+        setStatus('Sending recording to Discord');
+        try {
+          const sent = await uploadCaptureToDiscord(discordItem);
+          const sentItem = {
+            ...workingItem,
+            discordMessageId: sent.messageId,
+            discordChannelId: sent.channelId,
+            discordMessageUrl: sent.messageUrl,
+          };
+          workingItem = sentItem;
+          setLastCapture(sentItem);
+          updateCaptureRecord(sentItem);
+          outcomes.push('sent to Discord');
+        } catch (error) {
+          outcomes.push(queuedForRetry ? 'queued for Discord' : `Discord failed: ${errorMessage(error, 'Send failed')}`);
+        }
+      }
+    }
+
     const localPrefix = localSaveError
       ? `Local save failed: ${localSaveError}. `
       : localSaved
@@ -2639,7 +3096,7 @@ const DendroCaptureApp = () => {
         : '';
     if (!shouldSaveLocally) {
       workingItem = await deleteTransientCaptureFile(workingItem, { preservePreview: true });
-      if (workingItem.assetUrl || workingItem.googleDriveUrl) {
+      if (workingItem.assetUrl || workingItem.googleDriveUrl || workingItem.discordMessageUrl) {
         updateCaptureRecord(workingItem);
       }
     }
@@ -3281,14 +3738,25 @@ const DendroCaptureApp = () => {
         setStatus('API sending is blocked in Connection settings');
         return;
       }
-    } else if (!googleDriveCanUpload()) {
+    } else if (destination === 'googleDrive' && !googleDriveCanUpload()) {
       setStatus('Select Google Drive, paste the OAuth Client ID and Client Secret, and link your account before retrying');
+      return;
+    } else if (destination === 'discord' && !discordCanUpload()) {
+      setStatus('Select Discord and pair your account before retrying');
       return;
     }
     setBusy(`retry-${capture.id}`);
     setStatus(`Retrying ${queueDestinationLabel(capture)} upload`);
     try {
-      if (destination === 'googleDrive') {
+      if (destination === 'discord') {
+        const sent = await uploadCaptureToDiscord(capture);
+        updateCaptureRecord({
+          ...capture,
+          discordMessageId: sent.messageId,
+          discordChannelId: sent.channelId,
+          discordMessageUrl: sent.messageUrl,
+        });
+      } else if (destination === 'googleDrive') {
         const uploaded = await uploadCaptureToGoogleDrive(capture);
         updateCaptureRecord({
           ...capture,
@@ -3318,6 +3786,7 @@ const DendroCaptureApp = () => {
       const destination = queueDestination(capture);
       if (destination === 'dendroApi' && (!hasPairedDevice(deviceRef.current) || !settingsRef.current.apiSendingEnabled)) continue;
       if (destination === 'googleDrive' && !googleDriveCanUpload()) continue;
+      if (destination === 'discord' && !discordCanUpload()) continue;
       retried += 1;
       await retryPending(capture);
     }
@@ -3574,6 +4043,7 @@ const DendroCaptureApp = () => {
     { id: 'local', label: 'Local', icon: <ImageIcon size={15} /> },
     { id: 'dendroApi', label: 'Dendro API', icon: <UploadCloud size={15} /> },
     { id: 'googleDrive', label: 'Google Drive', icon: <Cloud size={15} /> },
+    { id: 'discord', label: 'Discord', icon: <Bot size={15} /> },
     { id: 'capture', label: 'Capture', icon: <Aperture size={15} /> },
   ];
   const latestCapture: LocalCapture | null = lastCapture || localCaptures[0] || pending[0] || null;
@@ -3589,34 +4059,47 @@ const DendroCaptureApp = () => {
     ? 'local storage'
     : settings.captureDestination === 'dendroApi'
       ? 'Dendro Assets'
-      : 'Google Drive';
+      : settings.captureDestination === 'discord'
+        ? 'Discord DMs'
+        : 'Google Drive';
   const destinationReady = settings.captureDestination === 'local'
     || (settings.captureDestination === 'dendroApi' && !!pairedDevice)
-    || (settings.captureDestination === 'googleDrive' && googleDrive.linked);
+    || (settings.captureDestination === 'googleDrive' && googleDrive.linked)
+    || (settings.captureDestination === 'discord' && discord.paired);
   const topStatusLabel = settings.captureDestination === 'local'
     ? 'Local mode'
     : settings.captureDestination === 'googleDrive'
       ? googleDrive.linked ? 'Drive linked' : 'Drive not linked'
-      : pairedDevice ? 'Paired' : 'Not paired';
+      : settings.captureDestination === 'discord'
+        ? discord.paired ? 'Discord paired' : 'Discord not paired'
+        : pairedDevice ? 'Paired' : 'Not paired';
   const connectionTitle = settings.captureDestination === 'local'
     ? 'Local mode'
     : settings.captureDestination === 'googleDrive'
       ? googleDrive.linked ? 'Google Drive linked' : 'Drive not linked'
-      : pairedDevice ? 'Paired device' : 'Not paired';
+      : settings.captureDestination === 'discord'
+        ? discord.paired ? 'Discord paired' : 'Discord not paired'
+        : pairedDevice ? 'Paired device' : 'Not paired';
   const connectionDetail = settings.captureDestination === 'local'
     ? (settings.saveLocally ? 'Saving captures locally' : 'Clipboard only')
     : settings.captureDestination === 'googleDrive'
       ? googleDrive.linked
         ? `Folder: ${googleDrive.folderName || 'DendroCapture'}`
         : 'Link Google Drive'
-      : pairedDevice
-        ? 'Connected to Dendro Assets'
-        : 'Pair Dendro Assets';
+      : settings.captureDestination === 'discord'
+        ? discord.paired
+          ? `DMs to ${discord.userName || 'paired member'}`
+          : 'Pair Discord'
+        : pairedDevice
+          ? 'Connected to Dendro Assets'
+          : 'Pair Dendro Assets';
   const statusPillLabel = settings.captureDestination === 'dendroApi' && pairedDevice
     ? settings.apiBaseUrl.replace(/^https?:\/\//, '')
     : settings.captureDestination === 'googleDrive' && googleDrive.linked
       ? googleDrive.folderName || 'DendroCapture'
-      : destinationLabel;
+      : settings.captureDestination === 'discord' && discord.paired
+        ? discord.userName || 'Discord'
+        : destinationLabel;
   const historyBlockedByCloud = !settings.saveLocally;
   const captureHeaderStatus = captureBusy ? status : 'Fast screenshots, instant clipboard, clean workflow.';
   const latestIsVideo = isVideoCapture(latestCapture);
@@ -4006,7 +4489,11 @@ const DendroCaptureApp = () => {
                         type="button"
                         title={`Retry ${queueDestinationLabel(item)} upload`}
                         onClick={() => void retryPending(item)}
-                        disabled={!!busy || (queueDestination(item) === 'dendroApi' ? !settings.apiSendingEnabled : !googleDriveCanUpload())}
+                        disabled={!!busy || (queueDestination(item) === 'dendroApi'
+                          ? !settings.apiSendingEnabled
+                          : queueDestination(item) === 'discord'
+                            ? !discordCanUpload()
+                            : !googleDriveCanUpload())}
                       >
                         <RefreshCw size={14} />
                       </button>
@@ -4080,6 +4567,17 @@ const DendroCaptureApp = () => {
                       <span>
                         <strong>Google Drive</strong>
                         <small>Upload to a DendroCapture Drive folder.</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`dc-destination-option${settings.captureDestination === 'discord' ? ' active' : ''}`}
+                      onClick={() => selectCaptureDestination('discord')}
+                    >
+                      <Bot size={18} />
+                      <span>
+                        <strong>Discord</strong>
+                        <small>DM captures through your own Discord bot.</small>
                       </span>
                     </button>
                   </div>
@@ -4290,6 +4788,165 @@ const DendroCaptureApp = () => {
                       <button type="button" className="dc-btn" onClick={() => void unlinkGoogleDrive()} disabled={busy === 'google-drive-unlink'}>
                         <X size={14} />
                         Unlink
+                      </button>
+                    )}
+                  </div>
+                </div>
+                )}
+
+                {settingsSection === 'discord' && (
+                <div className="dc-panel">
+                  <h2>Discord</h2>
+                  <p className="dc-muted">Captures are sent as direct messages by a Discord bot you own to whoever pairs below. When OCR finishes, the bot edits its message to add the recognized text.</p>
+                  <p className="dc-muted">The bot token stays on this computer and is only ever sent to Discord. Never share or publish a bot token — anyone holding it fully controls the bot.</p>
+                  <label className="dc-check dc-check-with-hint">
+                    <input
+                      type="checkbox"
+                      checked={settings.discordOcrEnabled}
+                      onChange={(e) => updateSettings({ discordOcrEnabled: e.target.checked })}
+                    />
+                    <span>
+                      Enable OCR
+                      <small>The capture is sent immediately. OCR runs afterward and the bot edits the Discord message with the text it found.</small>
+                    </span>
+                  </label>
+                  <div className="dc-drive-help">
+                    <div className="dc-drive-steps">
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">1</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Create (or reuse) your bot</strong>
+                          <small>Open the Developer Portal and create a New Application named e.g. DendroCapture. Reusing a bot you already run works too.</small>
+                          <span className="dc-drive-substeps">
+                            <span>On the Bot page, click Reset Token and copy the token for step 4.</span>
+                            <span>Still on the Bot page, enable Message Content Intent under Privileged Gateway Intents. Pairing cannot read the code without it.</span>
+                          </span>
+                        </span>
+                        <button type="button" className="dc-btn" onClick={() => void openUrl(DISCORD_DEVELOPER_PORTAL_URL)}>
+                          <Bot size={14} />
+                          Open Portal
+                        </button>
+                      </div>
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">2</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Invite the bot to your server</strong>
+                          <small>In OAuth2, use the URL Generator with the bot scope, then open the generated link and pick your server.</small>
+                          <span className="dc-drive-substeps">
+                            <span>Permissions to select: View Channels, Send Messages, Read Message History, and optionally Manage Messages.</span>
+                            <span>Skip this step if the bot is already in your server.</span>
+                          </span>
+                        </span>
+                      </div>
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">3</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Create the pairing channel</strong>
+                          <small>In your server, create a text channel named exactly #{DISCORD_PAIRING_CHANNEL}.</small>
+                          <span className="dc-drive-substeps">
+                            <span>The bot needs View Channel, Send Messages and Read Message History there.</span>
+                            <span>Optional: Manage Messages lets the bot delete pairing codes after use.</span>
+                          </span>
+                        </span>
+                      </div>
+                      <div className="dc-drive-step">
+                        <span className="dc-drive-step-index">4</span>
+                        <span className="dc-drive-step-copy">
+                          <strong>Pair your account</strong>
+                          <small>Paste the token below and click Pair Discord. Post the code DendroCapture shows in #{DISCORD_PAIRING_CHANNEL}, and the bot confirms in your DMs.</small>
+                          <span className="dc-drive-substeps">
+                            <span>Your Discord privacy settings must allow direct messages from server members.</span>
+                          </span>
+                        </span>
+                      </div>
+                    </div>
+                    <div className="dc-drive-troubleshoot">
+                      <AlertTriangle size={15} />
+                      <span>
+                        <strong>Pairing times out even though the code was posted?</strong>
+                        <small>Message Content Intent is probably off for the bot. Enable it in the Developer Portal, or mention the bot in the same message as the code.</small>
+                      </span>
+                    </div>
+                    <div className="dc-drive-troubleshoot">
+                      <AlertTriangle size={15} />
+                      <span>
+                        <strong>Paired but no DM arrives?</strong>
+                        <small>In Discord, open the server's privacy settings and allow direct messages from server members, then send a capture again.</small>
+                      </span>
+                    </div>
+                    <small className="dc-drive-note">Recordings above about 10 MB cannot be attached by bots; long videos are better sent to Google Drive.</small>
+                  </div>
+                  <label>
+                    Bot token
+                    <input
+                      type="password"
+                      value={settings.discordBotToken}
+                      placeholder="Paste the Discord bot token"
+                      spellCheck={false}
+                      autoComplete="off"
+                      onChange={(e) => updateSettings({ discordBotToken: e.target.value })}
+                    />
+                  </label>
+                  <label>
+                    Pairing channel ID (optional)
+                    <input
+                      value={settings.discordPairingChannelId}
+                      placeholder={`Leave empty to find #${DISCORD_PAIRING_CHANNEL} automatically`}
+                      spellCheck={false}
+                      onChange={(e) => updateSettings({ discordPairingChannelId: e.target.value })}
+                    />
+                  </label>
+                  {discordPairing ? (
+                    <div className="dc-discord-pairing">
+                      <span className="dc-discord-code">{discordPairing.code}</span>
+                      <span className="dc-discord-pairing-copy">
+                        <strong>Post this code in #{discordPairing.channelName}{discordPairing.guildName ? ` on ${discordPairing.guildName}` : ''}</strong>
+                        <small>Waiting for the message. The bot will DM whoever posts it.</small>
+                      </span>
+                      <button type="button" className="dc-btn" onClick={() => void navigator.clipboard?.writeText(discordPairing.code).catch(() => undefined)}>
+                        <Copy size={14} />
+                        Copy
+                      </button>
+                    </div>
+                  ) : discord.paired ? (
+                    <div className="dc-drive-status">
+                      <CheckCircle2 size={16} />
+                      <span>
+                        <strong>Paired with {discord.userName || 'a Discord member'}</strong>
+                        <small>{discord.botUsername ? `Bot: ${discord.botUsername}` : 'Captures are delivered by DM'}{discord.guildName ? ` · via ${discord.guildName}` : ''}</small>
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="dc-drive-status warning">
+                      <AlertTriangle size={16} />
+                      <span>
+                        <strong>Not paired</strong>
+                        <small>Paste the bot token, then pair your Discord account.</small>
+                      </span>
+                    </div>
+                  )}
+                  <div className="dc-drive-actions">
+                    {!discord.paired ? (
+                      busy === 'discord-pair' ? (
+                        <button type="button" className="dc-btn" onClick={() => cancelDiscordPairing()}>
+                          <X size={14} />
+                          Cancel pairing
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="dc-btn primary"
+                          onClick={() => void pairDiscord()}
+                          disabled={!!busy || !settings.discordBotToken.trim()}
+                        >
+                          <Bot size={14} />
+                          Pair Discord
+                        </button>
+                      )
+                    ) : (
+                      <button type="button" className="dc-btn" onClick={() => void unpairDiscord()} disabled={busy === 'discord-unpair'}>
+                        <X size={14} />
+                        Unpair
                       </button>
                     )}
                   </div>
