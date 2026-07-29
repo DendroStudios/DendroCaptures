@@ -43,6 +43,13 @@ type ResizeState = {
   changed: boolean;
 };
 
+type EndpointState = {
+  index: number;
+  endpoint: 'from' | 'to';
+  previousOps: AnnotationOp[];
+  changed: boolean;
+};
+
 type AnnotationHistory = {
   ops: AnnotationOp[];
   history: AnnotationOp[][];
@@ -77,6 +84,9 @@ type AnnotationEditorProps = {
 };
 
 const SELECTION_PADDING = 6;
+const TEXT_LINE_HEIGHT = 1.25;
+
+const textOpLines = (text: string): string[] => text.split('\n');
 
 const clampAnnotationSize = (value: number): number =>
   Math.max(3, Math.min(30, Math.round(value)));
@@ -191,9 +201,12 @@ const drawAnnotation = (ctx: CanvasRenderingContext2D, op: AnnotationOp) => {
     ctx.font = `700 ${op.fontSize}px Arial, sans-serif`;
     ctx.lineWidth = Math.max(3, Math.round(op.fontSize / 9));
     ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-    ctx.strokeText(op.text, op.at.x, op.at.y);
     ctx.fillStyle = op.color;
-    ctx.fillText(op.text, op.at.x, op.at.y);
+    textOpLines(op.text).forEach((line, index) => {
+      const y = op.at.y + index * op.fontSize * TEXT_LINE_HEIGHT;
+      ctx.strokeText(line, op.at.x, y);
+      ctx.fillText(line, op.at.x, y);
+    });
   }
   ctx.restore();
 };
@@ -224,11 +237,13 @@ const annotationBounds = (ctx: CanvasRenderingContext2D, op: AnnotationOp): Boun
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   }
   ctx.font = `700 ${op.fontSize}px Arial, sans-serif`;
+  const lines = textOpLines(op.text);
+  const maxWidth = lines.reduce((max, line) => Math.max(max, ctx.measureText(line).width), 0);
   return {
     x: op.at.x - 8,
     y: op.at.y - op.fontSize * 1.15,
-    width: ctx.measureText(op.text).width + 16,
-    height: op.fontSize * 1.35,
+    width: maxWidth + 16,
+    height: op.fontSize * 1.35 + (lines.length - 1) * op.fontSize * TEXT_LINE_HEIGHT,
   };
 };
 
@@ -282,6 +297,14 @@ const resizeHandlesForBounds = (bounds: Bounds): Array<{ handle: ResizeHandle; x
   ];
 };
 
+const hitArrowEndpoint = (ctx: CanvasRenderingContext2D, point: Point, op: AnnotationOp): 'from' | 'to' | null => {
+  if (op.type !== 'arrow') return null;
+  const hitRadius = resizeHandleSize(ctx) * 1.1;
+  if (Math.hypot(point.x - op.from.x, point.y - op.from.y) <= hitRadius) return 'from';
+  if (Math.hypot(point.x - op.to.x, point.y - op.to.y) <= hitRadius) return 'to';
+  return null;
+};
+
 const hitResizeHandle = (ctx: CanvasRenderingContext2D, point: Point, op: AnnotationOp): ResizeHandle | null => {
   const bounds = selectionBounds(ctx, op);
   const hitSize = resizeHandleSize(ctx) * 1.6;
@@ -308,12 +331,22 @@ const drawSelectionOutline = (ctx: CanvasRenderingContext2D, op: AnnotationOp) =
   ctx.fillStyle = '#ffffff';
   ctx.strokeStyle = 'rgba(30, 100, 183, 0.95)';
   ctx.lineWidth = Math.max(2, handleSize / 7);
-  resizeHandlesForBounds(bounds).forEach((handle) => {
-    ctx.beginPath();
-    ctx.rect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
-    ctx.fill();
-    ctx.stroke();
-  });
+  if (op.type === 'arrow') {
+    // Arrows are reshaped by dragging their endpoints, not a bounding box.
+    [op.from, op.to].forEach((point) => {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, handleSize * 0.65, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    });
+  } else {
+    resizeHandlesForBounds(bounds).forEach((handle) => {
+      ctx.beginPath();
+      ctx.rect(handle.x - handleSize / 2, handle.y - handleSize / 2, handleSize, handleSize);
+      ctx.fill();
+      ctx.stroke();
+    });
+  }
   ctx.restore();
 };
 
@@ -398,6 +431,7 @@ export const AnnotationEditor = ({
   const activePathRef = useRef<AnnotationOp | null>(null);
   const moveStateRef = useRef<MoveState | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
+  const endpointStateRef = useRef<EndpointState | null>(null);
   const sizeChangePreviousOpsRef = useRef<AnnotationOp[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -478,6 +512,27 @@ export const AnnotationEditor = ({
     return () => window.clearTimeout(id);
   }, [editingText?.opIndex, editingText?.left, editingText?.top]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+      if (editingText || selectedIndex === null) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT')) return;
+      event.preventDefault();
+      setAnnotationState((current) => {
+        if (!current.ops[selectedIndex]) return current;
+        return {
+          ops: current.ops.filter((_, index) => index !== selectedIndex),
+          history: [...current.history, current.ops].slice(-HISTORY_LIMIT),
+          future: [],
+        };
+      });
+      setSelectedIndex(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [editingText, selectedIndex]);
+
   const canvasPoint = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = event.currentTarget;
     const rect = canvas.getBoundingClientRect();
@@ -511,13 +566,15 @@ export const AnnotationEditor = ({
         const op = sourceOps[index];
         if (op.type !== 'text') continue;
         ctx.font = `700 ${op.fontSize}px Arial, sans-serif`;
-        const width = ctx.measureText(op.text).width;
+        const lines = textOpLines(op.text);
+        const width = lines.reduce((max, line) => Math.max(max, ctx.measureText(line).width), 0);
         const height = op.fontSize * 1.25;
+        const extraLines = (lines.length - 1) * op.fontSize * TEXT_LINE_HEIGHT;
         if (
           point.x >= op.at.x - 10 &&
           point.x <= op.at.x + width + 10 &&
           point.y >= op.at.y - height &&
-          point.y <= op.at.y + 12
+          point.y <= op.at.y + 12 + extraLines
         ) {
           return index;
         }
@@ -660,7 +717,18 @@ export const AnnotationEditor = ({
       const selectedHandleIndex = selectedIndex;
       const selectedOp = selectedHandleIndex !== null ? workingOps[selectedHandleIndex] : null;
       if (ctx && selectedHandleIndex !== null && selectedOp) {
-        const handle = hitResizeHandle(ctx, point, selectedOp);
+        const endpoint = hitArrowEndpoint(ctx, point, selectedOp);
+        if (endpoint) {
+          endpointStateRef.current = {
+            index: selectedHandleIndex,
+            endpoint,
+            previousOps: workingOps,
+            changed: false,
+          };
+          event.currentTarget.setPointerCapture(event.pointerId);
+          return;
+        }
+        const handle = selectedOp.type === 'arrow' ? null : hitResizeHandle(ctx, point, selectedOp);
         if (handle) {
           resizeStateRef.current = {
             index: selectedHandleIndex,
@@ -714,6 +782,20 @@ export const AnnotationEditor = ({
 
   const move = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!event.isPrimary) return;
+    const endpointState = endpointStateRef.current;
+    if (endpointState) {
+      const point = canvasPoint(event);
+      endpointState.changed = true;
+      setAnnotationState((current) => ({
+        ...current,
+        ops: current.ops.map((op, index) =>
+          index === endpointState.index && op.type === 'arrow'
+            ? { ...op, [endpointState.endpoint]: point }
+            : op
+        ),
+      }));
+      return;
+    }
     const resizeState = resizeStateRef.current;
     if (resizeState) {
       const point = canvasPoint(event);
@@ -765,6 +847,17 @@ export const AnnotationEditor = ({
 
   const finish = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!event.isPrimary) return;
+    const endpointState = endpointStateRef.current;
+    if (endpointState) {
+      endpointStateRef.current = null;
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture can already be released when a drag leaves the window.
+      }
+      if (endpointState.changed) pushGestureHistory(endpointState.previousOps);
+      return;
+    }
     const resizeState = resizeStateRef.current;
     if (resizeState) {
       resizeStateRef.current = null;
@@ -971,7 +1064,9 @@ export const AnnotationEditor = ({
                 if (event.key === 'Escape') {
                   event.preventDefault();
                   setEditingText(null);
-                } else if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                } else if (event.key === 'Enter' && !event.shiftKey) {
+                  // Plain Enter (or Ctrl/Cmd+Enter) commits; Shift+Enter
+                  // inserts a line break via the textarea default.
                   event.preventDefault();
                   commitTextEdit();
                 }

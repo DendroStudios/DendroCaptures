@@ -309,7 +309,7 @@ interface CaptureCancelPayload {
   restoreWindow?: boolean;
 }
 
-const APP_VERSION = '0.1.67';
+const APP_VERSION = '0.1.68';
 const SETTINGS_KEY = 'dendro-capture:settings';
 const DEVICE_KEY = 'dendro-capture:device';
 const PENDING_KEY = 'dendro-capture:pending';
@@ -2701,7 +2701,7 @@ const DendroCaptureApp = () => {
     } catch (error) {
       console.warn('Discord background OCR failed', error);
       setStatus(`Discord message sent, OCR skipped: ${errorMessage(error, 'OCR failed')}`);
-      // Clear the "Reading text (OCR)…" placeholder so the DM does not
+      // Clear the "Reading text (OCR)â€¦" placeholder so the DM does not
       // advertise an OCR pass that will never arrive.
       void invoke('discord_update_capture_ocr', {
         botToken: settingsRef.current.discordBotToken.trim() || null,
@@ -4798,7 +4798,7 @@ const DendroCaptureApp = () => {
                 <div className="dc-panel">
                   <h2>Discord</h2>
                   <p className="dc-muted">Captures are sent as direct messages by a Discord bot you own to whoever pairs below. When OCR finishes, the bot edits its message to add the recognized text.</p>
-                  <p className="dc-muted">The bot token stays on this computer and is only ever sent to Discord. Never share or publish a bot token — anyone holding it fully controls the bot.</p>
+                  <p className="dc-muted">The bot token stays on this computer and is only ever sent to Discord. Never share or publish a bot token â€” anyone holding it fully controls the bot.</p>
                   <label className="dc-check dc-check-with-hint">
                     <input
                       type="checkbox"
@@ -4913,7 +4913,7 @@ const DendroCaptureApp = () => {
                       <CheckCircle2 size={16} />
                       <span>
                         <strong>Paired with {discord.userName || 'a Discord member'}</strong>
-                        <small>{discord.botUsername ? `Bot: ${discord.botUsername}` : 'Captures are delivered by DM'}{discord.guildName ? ` · via ${discord.guildName}` : ''}</small>
+                        <small>{discord.botUsername ? `Bot: ${discord.botUsername}` : 'Captures are delivered by DM'}{discord.guildName ? ` Â· via ${discord.guildName}` : ''}</small>
                       </span>
                     </div>
                   ) : (
